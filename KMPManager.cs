@@ -109,6 +109,21 @@ namespace KMP
 		private float lastKeyPressTime = 0.0f;
 		private float lastFullProtovesselUpdate = 0.0f;
 		private float lastScenarioUpdateTime = 0.0f;
+		private float lastTimeSyncTime = 0.0f;
+
+		//NTP-style time syncronize settings
+		private bool isSkewingTime = false;
+		private Int64 offsetSyncTick = 0; //The difference between the servers system clock and ours.
+		private List<Int64> listClientTimeSyncLatency = new List<Int64>(); //Holds old sync time messages so we can filter bad ones
+		private List<Int64> listClientTimeSyncOffset = new List<Int64>(); //Holds old sync time messages so we can filter bad ones
+		private int currentSyncTimeReceived = 0; //Number of TIME_SYNC's received
+		private bool isTimeSyncronized;
+		private const Int64 SYNC_TIME_OFFSET_FILTER = 500000; //50 milliseconds, If the new offset varies by more than 50 milliseconds the message is discarded.
+		private const Int64 SYNC_TIME_LATENCY_FILTER = 5000000; //500 milliseconds, Must receive reply within this time or the message is discarded
+		private const float SYNC_TIME_INTERVAL = 30f; //How often to sync time.
+		private const int SYNC_TIME_VALID_COUNT = 4; //Number of SYNC_TIME's to receive until time is valid.
+		private const int MAX_TIME_SYNC_HISTORY = 10; //The last 10 SYNC_TIME's are used for the offset filter.
+		private ScreenMessage skewMessage;
 
 		private Queue<KMPVesselUpdate> vesselUpdateQueue = new Queue<KMPVesselUpdate>();
 		private Queue<KMPVesselUpdate> newVesselUpdateQueue = new Queue<KMPVesselUpdate>();
@@ -167,6 +182,8 @@ namespace KMP
 		
 		public double lastTick = 0d;
 		public double targetTick = 0d;
+		public double skewTargetTick = 0;
+		public long skewServerTime = 0;
 		
 		public Vector3d kscPosition = Vector3d.zero;
 		
@@ -400,60 +417,7 @@ namespace KMP
 					}
 				}
 
-				//Update universe time
-				try
-				{
-					double currentTick = Planetarium.GetUniversalTime();
-					if (isInFlight && targetTick > currentTick+0.05d)
-					{
-						Log.Debug("Syncing to new time " + targetTick + " from " + Planetarium.GetUniversalTime());
-						if (FlightGlobals.ActiveVessel.situation != Vessel.Situations.PRELAUNCH
-						    && FlightGlobals.ActiveVessel.situation != Vessel.Situations.LANDED
-						    && FlightGlobals.ActiveVessel.situation != Vessel.Situations.SPLASHED)
-						{
-							Vector3d oldObtVel = FlightGlobals.ActiveVessel.obt_velocity;
-							if (FlightGlobals.ActiveVessel.orbit.EndUT > 0)
-							{
-								double lastEndUT =  FlightGlobals.ActiveVessel.orbit.EndUT;
-								while (FlightGlobals.ActiveVessel.orbit.EndUT > 0
-								       && FlightGlobals.ActiveVessel.orbit.EndUT < targetTick
-								       && FlightGlobals.ActiveVessel.orbit.EndUT > lastEndUT
-								       && FlightGlobals.ActiveVessel.orbit.nextPatch != null)
-								{
-									Log.Debug("orbit EndUT < target: " + FlightGlobals.ActiveVessel.orbit.EndUT + " vs " + targetTick);
-									lastEndUT =  FlightGlobals.ActiveVessel.orbit.EndUT;
-									FlightGlobals.ActiveVessel.orbitDriver.orbit = FlightGlobals.ActiveVessel.orbit.nextPatch;
-									FlightGlobals.ActiveVessel.orbitDriver.UpdateOrbit();
-									if (FlightGlobals.ActiveVessel.orbit.referenceBody == null) FlightGlobals.ActiveVessel.orbit.referenceBody = FlightGlobals.Bodies.Find(b => b.name == "Sun");
-									Log.Debug("updated to next patch");
-								}
-							}
-							try
-				            {
-				                OrbitPhysicsManager.HoldVesselUnpack(1);
-				            }
-				            catch (NullReferenceException e)
-				            {
-                        Log.Debug("Exception thrown in updateStep(), catch 2, Exception: {0}", e.ToString());
-				            }
-							//Krakensbane shift to new orbital location
-							if (targetTick > currentTick+2.5d //if badly out of sync
-							    && !(FlightGlobals.ActiveVessel.orbit.referenceBody.atmosphere && FlightGlobals.ActiveVessel.orbit.altitude < FlightGlobals.ActiveVessel.orbit.referenceBody.maxAtmosphereAltitude)) //and not in atmo
-							{
-								Log.Debug("Krakensbane shift");
-								Vector3d diffPos = FlightGlobals.ActiveVessel.orbit.getPositionAtUT(targetTick) - FlightGlobals.ship_position;
-								foreach (Vessel otherVessel in FlightGlobals.Vessels.Where(v => v.packed == false && (v.id != FlightGlobals.ActiveVessel.id || (v.loaded && Vector3d.Distance(FlightGlobals.ship_position,v.GetWorldPos3D()) < INACTIVE_VESSEL_RANGE))))
-		                			otherVessel.GoOnRails();
-								getKrakensbane().setOffset(diffPos);
-								//Update velocity
-								FlightGlobals.ActiveVessel.ChangeWorldVelocity((-1 * oldObtVel) + FlightGlobals.ActiveVessel.orbitDriver.orbit.getOrbitalVelocityAtUT(targetTick).xzy);
-	            				FlightGlobals.ActiveVessel.orbitDriver.vel = FlightGlobals.ActiveVessel.orbit.vel;
-							}
-						}
-						Planetarium.SetUniversalTime(targetTick);
-						Log.Debug("sync completed");
-					}
-				} catch (Exception e) { Log.Debug("Exception thrown in updateStep(), catch 3, Exception: {0}", e.ToString()); Log.Debug("error during sync: " + e.Message + " " + e.StackTrace); }
+				krakensBaneWarp();
 
 				writeUpdates();
 				
@@ -531,7 +495,14 @@ namespace KMP
 				
 				foreach (String key in delete_list)
 					playerStatus.Remove(key);
-				
+
+				//Queue a time sync if needed
+				if (lastTimeSyncTime > (UnityEngine.Time.realtimeSinceStartup + SYNC_TIME_INTERVAL)) {
+					SyncTime();
+				}
+
+				//Do the Phys-warp NTP time sync dance.
+				SkewTime();
 				
 				//Prevent cases of remaining unfixed NREs from remote vessel updates from creating an inconsistent game state
 				if (HighLogic.fetch.log.Count > 500 && isInFlight && !syncing)
@@ -3298,12 +3269,18 @@ namespace KMP
 				}
 				else
 				{
-					if (!warping) writePrimaryUpdate(); //Ensure server catches any vessel switch before warp
-					warping = true;
-					Log.Debug("warping");
+					if (!warping) {
+						skewServerTime = 0;
+						skewTargetTick = 0;
+						writePrimaryUpdate (); //Ensure server catches any vessel switch before warp
+						Log.Debug("warping");
+					}
+				warping = true;
 				}
-				Log.Debug("sending: " + TimeWarp.CurrentRate);
-				byte[] update_bytes = BitConverter.GetBytes(TimeWarp.CurrentRate);
+				Log.Debug("sending: " + TimeWarp.CurrentRate + ", " + Planetarium.GetUniversalTime());
+				byte[] update_bytes = new byte[12]; //warp rate float (4) + current tick double (8)
+				BitConverter.GetBytes(TimeWarp.CurrentRate).CopyTo(update_bytes, 0);
+				BitConverter.GetBytes(Planetarium.GetUniversalTime()).CopyTo(update_bytes, 4);
 				enqueuePluginInteropMessage(KMPCommon.PluginInteropMessageID.WARPING, update_bytes);
 			}
 		}
@@ -3347,6 +3324,7 @@ namespace KMP
 		
 		public void HandleSyncCompleted()
 		{
+			SyncTime();
 			if (!forceQuit && syncing && !inGameSyncing && gameRunning) Invoke("finishSync",5f);
 			else
 			{
@@ -3380,6 +3358,209 @@ namespace KMP
 				StartCoroutine(returnToSpaceCenter());
 				//Disable debug logging once synced unless explicitly enabled
 			}
+		}
+
+		private void krakensBaneWarp(double krakensTick = 0) {
+			if (warping) return;
+		//Update universe time
+		if (krakensTick == 0) {
+			krakensTick = targetTick;
+		}
+		try
+		{
+			double currentTick = Planetarium.GetUniversalTime();
+			//Let SkewTime handle errors smaller than 5s.
+			if (isInFlight && krakensTick > currentTick+5d)
+			{
+				Log.Debug("Syncing to new time " + krakensTick + " from " + Planetarium.GetUniversalTime());
+				if (FlightGlobals.ActiveVessel.situation != Vessel.Situations.PRELAUNCH
+				    && FlightGlobals.ActiveVessel.situation != Vessel.Situations.LANDED
+				    && FlightGlobals.ActiveVessel.situation != Vessel.Situations.SPLASHED)
+				{
+					Vector3d oldObtVel = FlightGlobals.ActiveVessel.obt_velocity;
+					if (FlightGlobals.ActiveVessel.orbit.EndUT > 0)
+					{
+						double lastEndUT =  FlightGlobals.ActiveVessel.orbit.EndUT;
+						while (FlightGlobals.ActiveVessel.orbit.EndUT > 0
+						       && FlightGlobals.ActiveVessel.orbit.EndUT < krakensTick
+						       && FlightGlobals.ActiveVessel.orbit.EndUT > lastEndUT
+						       && FlightGlobals.ActiveVessel.orbit.nextPatch != null)
+						{
+							Log.Debug("orbit EndUT < target: " + FlightGlobals.ActiveVessel.orbit.EndUT + " vs " + krakensTick);
+							lastEndUT =  FlightGlobals.ActiveVessel.orbit.EndUT;
+							FlightGlobals.ActiveVessel.orbitDriver.orbit = FlightGlobals.ActiveVessel.orbit.nextPatch;
+							FlightGlobals.ActiveVessel.orbitDriver.UpdateOrbit();
+							if (FlightGlobals.ActiveVessel.orbit.referenceBody == null) FlightGlobals.ActiveVessel.orbit.referenceBody = FlightGlobals.Bodies.Find(b => b.name == "Sun");
+							Log.Debug("updated to next patch");
+						}
+					}
+					try
+					{
+						OrbitPhysicsManager.HoldVesselUnpack(1);
+					}
+					catch (NullReferenceException e)
+					{
+						Log.Debug("Exception thrown in updateStep(), catch 2, Exception: {0}", e.ToString());
+					}
+					//Krakensbane shift to new orbital location
+					if (krakensTick > currentTick+2.5d //if badly out of sync
+					    && !(FlightGlobals.ActiveVessel.orbit.referenceBody.atmosphere && FlightGlobals.ActiveVessel.orbit.altitude < FlightGlobals.ActiveVessel.orbit.referenceBody.maxAtmosphereAltitude)) //and not in atmo
+					{
+						Log.Debug("Krakensbane shift");
+						Vector3d diffPos = FlightGlobals.ActiveVessel.orbit.getPositionAtUT(krakensTick) - FlightGlobals.ship_position;
+						foreach (Vessel otherVessel in FlightGlobals.Vessels.Where(v => v.packed == false && (v.id != FlightGlobals.ActiveVessel.id || (v.loaded && Vector3d.Distance(FlightGlobals.ship_position,v.GetWorldPos3D()) < INACTIVE_VESSEL_RANGE))))
+							otherVessel.GoOnRails();
+						getKrakensbane().setOffset(diffPos);
+						//Update velocity
+						FlightGlobals.ActiveVessel.ChangeWorldVelocity((-1 * oldObtVel) + FlightGlobals.ActiveVessel.orbitDriver.orbit.getOrbitalVelocityAtUT(krakensTick).xzy);
+						FlightGlobals.ActiveVessel.orbitDriver.vel = FlightGlobals.ActiveVessel.orbit.vel;
+					}
+				}
+				Planetarium.SetUniversalTime(krakensTick);
+				Log.Debug("sync completed");
+			}
+		} catch (Exception e) { Log.Debug("Exception thrown in krakensBaneWarp(), catch 1, Exception: {0}", e.ToString()); Log.Debug("error during sync: " + e.Message + " " + e.StackTrace); }
+		}
+
+		private void SkewTime ()
+		{
+			if (syncing || warping) return;
+
+			if (!isInFlightOrTracking && isSkewingTime) {
+				Log.Debug ("Stopping skew time");
+				isSkewingTime = false;
+				Time.timeScale = 1f;
+				return;
+			}
+
+
+			//This brings the computers MET timer in to line with the server.
+			if (isTimeSyncronized && skewServerTime != 0 && skewTargetTick != 0) {
+				long timeFromLastSync = (DateTime.UtcNow.Ticks + offsetSyncTick) - skewServerTime;
+				double timeFromLastSyncSeconds = (double)timeFromLastSync / 10000000;
+				double currentError = Planetarium.GetUniversalTime () - (skewTargetTick + timeFromLastSyncSeconds); //Ticks are integers of 100ns, Planetarium camera is a float in seconds.
+				double currentErrorMs = Math.Round (currentError * 1000, 2);
+				double currentErrorS = Math.Round (currentError, 2);
+
+				if (Math.Abs (currentError) > 5) {
+					Log.Debug ("Skewed time fast: " + currentErrorS + " reset.");
+					skewMessage = ScreenMessages.PostScreenMessage ("Time skew fast, error: " + currentErrorS + " seconds.", 4f, ScreenMessageStyle.UPPER_RIGHT);
+					if (isInFlight) {
+						krakensBaneWarp(skewTargetTick + timeFromLastSyncSeconds);
+					} else {
+						Planetarium.SetUniversalTime(skewTargetTick + timeFromLastSyncSeconds);
+					}
+					return;
+				}
+
+				float timeWarpRate = 1f;
+
+				if (currentError < -0.0)
+					timeWarpRate = 1.05f;
+
+				if (currentError < -0.2)
+					timeWarpRate = 1.1f;
+
+				if (currentError < -0.5)
+					timeWarpRate = 1.5f;
+
+				if (currentError < -1)
+					timeWarpRate = 2f;
+
+				if (currentError > 0.0)
+					timeWarpRate = 0.95f;
+
+				if (currentError > 0.2)
+					timeWarpRate = 0.9f;
+
+				if (currentError > 0.5)
+					timeWarpRate = 0.75f;
+
+				if (currentError > 1)
+					timeWarpRate = 0.5f;
+
+
+
+
+
+				if (Math.Abs(currentError) > 0.2) {
+					isSkewingTime = true;
+					Time.timeScale = timeWarpRate;
+				}
+
+				if (Math.Abs(currentError) < 0.05 && isSkewingTime) {
+					isSkewingTime = false;
+					Time.timeScale = 1;
+				}
+				if (isSkewingTime) {
+					Log.Debug ("Current Offset: " + currentError + ", Time warp rate: " + timeWarpRate.ToString() + "x");
+					try {
+						skewMessage.duration = 0;
+					}
+					catch (Exception e) {
+						Log.Debug (e.ToString ());
+					}
+					skewMessage = ScreenMessages.PostScreenMessage("Time skew error: " + currentErrorMs + "ms.", 1f, ScreenMessageStyle.UPPER_RIGHT);
+				}
+			}
+		}
+
+		private void StopSkewingTime() {
+			isSkewingTime = false;
+		}
+
+		private void SyncTime()
+		{
+			//Have to write the actual time just before sending.
+			enqueuePluginInteropMessage(KMPCommon.PluginInteropMessageID.SYNC_TIME, null);
+		}
+
+		public void HandleSyncTimeCompleted(byte[] data)
+		{
+			currentSyncTimeReceived = currentSyncTimeReceived + 1;
+			Int64 clientSend = BitConverter.ToInt64 (data, 0);
+			Int64 serverReceive = BitConverter.ToInt64 (data, 8);
+			Int64 serverSend = BitConverter.ToInt64 (data, 16);
+			Int64 clientReceive = DateTime.UtcNow.Ticks;
+			//Fancy NTP algorithm
+			Int64 clientLatency = (clientReceive - clientSend) - (serverSend - serverReceive);
+			Int64 clientOffset = ((serverReceive - clientSend) + (serverSend - clientReceive))/2;
+
+			//If time is synced, throw out outliers.
+			if (isTimeSyncronized) {
+				Int64 clientOffsetFilter = (Int64)listClientTimeSyncOffset.Average();
+				if (clientLatency < SYNC_TIME_LATENCY_FILTER && Math.Abs(clientOffset-clientOffsetFilter) < SYNC_TIME_OFFSET_FILTER) {
+					listClientTimeSyncOffset.Add (clientOffset);
+					listClientTimeSyncLatency.Add (clientLatency);
+				}
+			//If time is not synced, add all data (as there can be no outliers).
+			} else {
+				listClientTimeSyncOffset.Add(clientOffset);
+				listClientTimeSyncLatency.Add(clientLatency);
+				SyncTime();
+			}
+
+			//If received enough TIME_SYNC messages, set time to syncronized.
+			if (currentSyncTimeReceived >= SYNC_TIME_VALID_COUNT && !isTimeSyncronized) {
+				offsetSyncTick = (Int64)listClientTimeSyncOffset.Average();
+				Int64 latencySyncTick = (Int64)listClientTimeSyncLatency.Average();
+				isTimeSyncronized = true;
+				Log.Debug("Initial client time syncronized: " + (latencySyncTick/10000).ToString() + "ms latency, " + (offsetSyncTick/10000).ToString() + "ms offset");
+			}
+
+			if (listClientTimeSyncOffset.Count > MAX_TIME_SYNC_HISTORY) {
+				listClientTimeSyncOffset.RemoveAt(0);
+			}
+
+			if (listClientTimeSyncLatency.Count > MAX_TIME_SYNC_HISTORY) {
+				listClientTimeSyncLatency.RemoveAt(0);
+			}
+
+			//Update offset timer so the physwrap skew can use it
+			if (isTimeSyncronized) {
+				offsetSyncTick = (Int64)listClientTimeSyncOffset.Average();
+			}
+			lastTimeSyncTime = UnityEngine.Time.realtimeSinceStartup;
 		}
 
 		private void OnGameSceneLoadRequested(GameScenes data)
@@ -4071,13 +4252,17 @@ namespace KMP
 					
 					serverVessels_RendezvousSmoothPos.Clear();
 					serverVessels_RendezvousSmoothVel.Clear();
+
+					isTimeSyncronized = false;
+					currentSyncTimeReceived = 0;
+					listClientTimeSyncLatency.Clear ();
+					listClientTimeSyncOffset.Clear ();
 	
 					newFlags.Clear();
 					
 					//Start MP game
 					KMPConnectionDisplay.windowEnabled = false;
 					gameRunning = true;
-					GameSettings.PHYSICS_FRAME_DT_LIMIT = 1.0f;
 					HighLogic.SaveFolder = "KMP";
 					HighLogic.CurrentGame = GamePersistence.LoadGame("start",HighLogic.SaveFolder,false,true);
 					HighLogic.CurrentGame.Parameters.Flight.CanAutoSave = false;
@@ -4097,7 +4282,7 @@ namespace KMP
 					GamePersistence.SaveGame("persistent",HighLogic.SaveFolder,SaveMode.OVERWRITE);
 					GameEvents.onFlightReady.Add(this.OnFirstFlightReady);
 					syncing = true;
-					
+
 					HighLogic.CurrentGame.Start();
 					
 					if (HasModule("ResearchAndDevelopment"))

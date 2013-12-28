@@ -1055,13 +1055,20 @@ namespace KMP
                     }
                     break;
 
-                case KMPCommon.ServerMessageID.SYNC:
-                    if (data != null) gameManager.targetTick = BitConverter.ToDouble(data, 0) + Convert.ToDouble(lastPing);
-
+				case KMPCommon.ServerMessageID.SYNC:
+					if (data != null) {
+						gameManager.targetTick = BitConverter.ToDouble (data, 0) + Convert.ToDouble (lastPing);
+						gameManager.skewTargetTick = BitConverter.ToDouble (data, 0);
+						gameManager.skewServerTime = BitConverter.ToInt64 (data, 8);
+						Log.Debug ("Client time locked to server:" + gameManager.skewTargetTick + " server time: " + gameManager.skewServerTime);
+					}
                     break;
                 case KMPCommon.ServerMessageID.SYNC_COMPLETE:
                     gameManager.HandleSyncCompleted();
                     break;
+				case KMPCommon.ServerMessageID.SYNC_TIME:
+					gameManager.HandleSyncTimeCompleted(data);
+					break;
             }
         }
 
@@ -1726,6 +1733,12 @@ namespace KMP
                 case KMPCommon.PluginInteropMessageID.SSYNC:
                     sendMessageTCP(KMPCommon.ClientMessageID.SSYNC, data);
                     break;
+				case KMPCommon.PluginInteropMessageID.SYNC_TIME:
+					//Have to write the message here. There cannot be any delay sending after writing the time in this message.
+					byte[] newdata = new byte[8];
+					BitConverter.GetBytes (DateTime.UtcNow.Ticks).CopyTo (newdata, 0);
+					sendMessageTCP(KMPCommon.ClientMessageID.SYNC_TIME, newdata);
+					break;
             }
         }
 

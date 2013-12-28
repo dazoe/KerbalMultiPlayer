@@ -445,6 +445,7 @@ namespace KMPServer
 							queuedOutMessages.TryDequeue(out next_message);
 						}
 						isClientSendingData = true;
+						syncTimeRewrite(ref next_message);
 						tcpClient.GetStream().BeginWrite(next_message, 0, next_message.Length, asyncSend, next_message);
 					}
 				}
@@ -465,6 +466,20 @@ namespace KMPServer
             }
             catch (System.NullReferenceException) { }
 			
+		}
+
+		private void syncTimeRewrite(ref byte[] next_message) {
+			//SYNC_TIME Rewriting
+			int next_message_id = BitConverter.ToInt32(next_message, 0);
+			if (next_message_id == (int)KMPCommon.ServerMessageID.SYNC_TIME) {
+				byte[] next_message_stripped = new byte[next_message.Length - 8];
+				Array.Copy (next_message, 8, next_message_stripped, 0, next_message.Length - 8);
+				byte[] next_message_decompressed = KMPCommon.Decompress(next_message_stripped);
+				byte[] time_sync_rewrite = new byte[24];
+				next_message_decompressed.CopyTo(time_sync_rewrite, 0);
+				BitConverter.GetBytes(DateTime.UtcNow.Ticks).CopyTo(time_sync_rewrite, 16);
+				next_message = Server.buildMessageArray(KMPCommon.ServerMessageID.SYNC_TIME, time_sync_rewrite);
+			}
 		}
 
 		public void queueOutgoingMessage(KMPCommon.ServerMessageID id, byte[] data)

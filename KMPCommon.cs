@@ -18,7 +18,7 @@ public class KMPCommon
     }
 
 	public const Int32 FILE_FORMAT_VERSION = 10000;
-	public const Int32 NET_PROTOCOL_VERSION = 10011;
+	public const Int32 NET_PROTOCOL_VERSION = 10012;
 	public const int MSG_HEADER_LENGTH = 8;
     public const int MAX_MESSAGE_SIZE = 1024 * 1024; //Enough room for a max-size craft file
 	public const int MESSAGE_COMPRESSION_THRESHOLD = 4096;
@@ -84,7 +84,8 @@ public class KMPCommon
 		ACTIVITY_UPDATE_IN_FLIGHT,
 		PING,
 		WARPING,
-		SSYNC
+		SSYNC,
+		SYNC_TIME /*NTP style sync*/
 	}
 
 	public enum ServerMessageID
@@ -105,7 +106,8 @@ public class KMPCommon
 		CRAFT_FILE /*Craft Type Byte : Craft name length : Craft Name : File bytes*/,
 		PING_REPLY,
 		SYNC /*tick*/,
-		SYNC_COMPLETE
+		SYNC_COMPLETE,
+		SYNC_TIME /*NTP style sync*/
 	}
 
 	public enum ClientInteropMessageID
@@ -128,7 +130,8 @@ public class KMPCommon
 		SECONDARY_PLUGIN_UPDATE /*data*/,
 		SCENARIO_UPDATE /*data*/,
 		WARPING /*data*/,
-		SSYNC /*data*/
+		SSYNC /*data*/,
+		SYNC_TIME /*data*/
 	}
 	
 	

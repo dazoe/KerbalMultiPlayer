@@ -94,6 +94,8 @@ namespace KMPServer
 
         private bool backedUpSinceEmpty = false;
         private Dictionary<Guid, long> recentlyDestroyed = new Dictionary<Guid, long>();
+		private Dictionary<int, double> subSpaceMasterTick = new Dictionary<int, double>();
+		private Dictionary<int, long> subSpaceMasterTime = new Dictionary<int, long>();
 
 		private Boolean bHandleCommandsRunning = true;
 		
@@ -1715,8 +1717,8 @@ namespace KMPServer
             clientMessageQueue.Enqueue(message);
         }
 
-        private KMPCommon.ClientMessageID[] AllowNullDataMessages = { KMPCommon.ClientMessageID.SCREEN_WATCH_PLAYER, KMPCommon.ClientMessageID.CONNECTION_END, KMPCommon.ClientMessageID.ACTIVITY_UPDATE_IN_FLIGHT, KMPCommon.ClientMessageID.ACTIVITY_UPDATE_IN_GAME, KMPCommon.ClientMessageID.PING };
-        private KMPCommon.ClientMessageID[] AllowClientNotReadyMessages = { KMPCommon.ClientMessageID.HANDSHAKE, KMPCommon.ClientMessageID.TEXT_MESSAGE, KMPCommon.ClientMessageID.SCREENSHOT_SHARE, KMPCommon.ClientMessageID.CONNECTION_END, KMPCommon.ClientMessageID.ACTIVITY_UPDATE_IN_FLIGHT, KMPCommon.ClientMessageID.ACTIVITY_UPDATE_IN_GAME, KMPCommon.ClientMessageID.PING, KMPCommon.ClientMessageID.UDP_PROBE, KMPCommon.ClientMessageID.WARPING, KMPCommon.ClientMessageID.SSYNC };
+        private KMPCommon.ClientMessageID[] AllowNullDataMessages = { KMPCommon.ClientMessageID.SCREEN_WATCH_PLAYER, KMPCommon.ClientMessageID.CONNECTION_END, KMPCommon.ClientMessageID.ACTIVITY_UPDATE_IN_FLIGHT, KMPCommon.ClientMessageID.ACTIVITY_UPDATE_IN_GAME, KMPCommon.ClientMessageID.PING, KMPCommon.ClientMessageID.SYNC_TIME };
+        private KMPCommon.ClientMessageID[] AllowClientNotReadyMessages = { KMPCommon.ClientMessageID.HANDSHAKE, KMPCommon.ClientMessageID.TEXT_MESSAGE, KMPCommon.ClientMessageID.SCREENSHOT_SHARE, KMPCommon.ClientMessageID.CONNECTION_END, KMPCommon.ClientMessageID.ACTIVITY_UPDATE_IN_FLIGHT, KMPCommon.ClientMessageID.ACTIVITY_UPDATE_IN_GAME, KMPCommon.ClientMessageID.PING, KMPCommon.ClientMessageID.UDP_PROBE, KMPCommon.ClientMessageID.WARPING, KMPCommon.ClientMessageID.SSYNC, KMPCommon.ClientMessageID.SYNC_TIME };
 
         public void handleMessage(Client cl, KMPCommon.ClientMessageID id, byte[] data)
         {
@@ -1779,6 +1781,9 @@ namespace KMPServer
 	                    case KMPCommon.ClientMessageID.SSYNC:
 	                        HandleSSync(cl, data);
 	                        break;
+						case KMPCommon.ClientMessageID.SYNC_TIME:
+							HandleTimeSync(cl, data);
+							break;
 	                }
 	            }
 	            catch (NullReferenceException)
@@ -1821,9 +1826,21 @@ namespace KMPServer
             sendSubspace(cl, true);
         }
 
+		private void HandleTimeSync(Client cl, byte[] data)
+		{
+			//Message format: clientsendtick(8), serverreceivetick(8), serversendtick(8). The server send tick gets added during actual sending.
+			byte[] newdata = new byte[16];
+			data.CopyTo (newdata, 0);
+			BitConverter.GetBytes(DateTime.UtcNow.Ticks).CopyTo(newdata, 8);
+			byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.SYNC_TIME, newdata);
+			cl.queueOutgoingMessage(message_bytes); //This is still re-written during the actual send.
+			Log.Debug("{0} time sync request", cl.username);
+		}
+
         private void HandleWarping(Client cl, byte[] data)
         {
             float rate = BitConverter.ToSingle(data, 0);
+			double newsubspacetick = BitConverter.ToDouble(data, 4);
             if (cl.warping)
             {
                 if (rate < 1.1f)
@@ -1860,8 +1877,11 @@ namespace KMPServer
                     }
 					if (settings.useMySQL) universeDB.Close();
                     cl.currentSubspaceID = newSubspace;
+					Log.Debug("Adding new time sync data for subspace {0}", newSubspace);
+					subSpaceMasterTick.Add(cl.currentSubspaceID, newsubspacetick);
+					subSpaceMasterTime.Add(cl.currentSubspaceID, DateTime.UtcNow.Ticks);
 					cl.warping = false;
-                    sendSubspace(cl, true, false);
+                    sendSubspace(cl, true, true);
 					cl.lastTick = -1d;
                     Log.Activity("{0} set to new subspace {1}", cl.username, newSubspace);
                 }
@@ -3352,8 +3372,22 @@ namespace KMPServer
 		
         private void sendSyncMessage(Client cl, double tick)
         {
+			double subspaceTick = tick;
+			long subspaceTime = DateTime.UtcNow.Ticks;
+			if (subSpaceMasterTick.ContainsKey(cl.currentSubspaceID)) {
+				double tickOffset = (double) (subspaceTime - subSpaceMasterTime[cl.currentSubspaceID]) / 10000000; //The magic number that converts 100ns to seconds.
+				subspaceTick = subSpaceMasterTick[cl.currentSubspaceID] + tickOffset;
+				Log.Debug ("Found entry: " + tickOffset + " offset for subspace " + cl.currentSubspaceID);
+			} else {
+				subSpaceMasterTick.Add(cl.currentSubspaceID, subspaceTick);
+				subSpaceMasterTime.Add(cl.currentSubspaceID, subspaceTime);
+				Log.Debug ("Added entry for subspace " + cl.currentSubspaceID);
+			}
             //Log.Info("Time sync for: " + cl.username);
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.SYNC, BitConverter.GetBytes(tick));
+			byte[] timesyncdata = new byte[16]; //The size of double and long are both 8.
+			BitConverter.GetBytes(subspaceTick).CopyTo(timesyncdata, 0);
+			BitConverter.GetBytes(subspaceTime).CopyTo(timesyncdata, 8);
+            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.SYNC, timesyncdata);
             cl.queueOutgoingMessage(message_bytes);
         }
 		
