@@ -1,10 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using System.Reflection;
 using System.IO;
-using ICSharpCode.SharpZipLib.GZip;
 
 public class KMPCommon
 {
@@ -21,7 +21,8 @@ public class KMPCommon
 	public const Int32 NET_PROTOCOL_VERSION = 10011;
 	public const int MSG_HEADER_LENGTH = 8;
     public const int MAX_MESSAGE_SIZE = 1024 * 1024; //Enough room for a max-size craft file
-	public const int MESSAGE_COMPRESSION_THRESHOLD = 4096;
+//	public const int MESSAGE_COMPRESSION_THRESHOLD = 4096;
+	public const int MESSAGE_COMPRESSION_THRESHOLD = 10;
 	public const int INTEROP_MSG_HEADER_LENGTH = 8;
 
 	public const int SERVER_SETTINGS_LENGTH = 23; //Length of fixed position information. Variable length settings start after this (including the header).
@@ -142,7 +143,7 @@ public class KMPCommon
 		if (data == null) return null;
 		byte[] compressedData = null;
         MemoryStream ms = null;
-        GZipOutputStream gzip = null;
+        GZipStream gzip = null;
 		try
         {
 			ms = new MemoryStream();
@@ -166,7 +167,7 @@ public class KMPCommon
 	            {
 					writer.Write(true);
 	                writer.Write(size);
-	                gzip = new GZipOutputStream(ms);
+	                gzip = new GZipStream(ms, CompressionMode.Compress);
 	                gzip.Write(data, 0, data.Length);
 	                gzip.Close();
 	                compressedData = ms.ToArray();
@@ -192,7 +193,7 @@ public class KMPCommon
 		if (data == null) return null;
 		byte[] decompressedData = null;
         MemoryStream ms = null;
-        GZipInputStream gzip = null;
+        GZipStream gzip = null;
         try
 		{
 			ms = new MemoryStream(data,false);
@@ -208,7 +209,7 @@ public class KMPCommon
 				{
 					//Decompress
 	                Int32 size = reader.ReadInt32();
-	                gzip = new GZipInputStream(ms);
+	                gzip = new GZipStream(ms, CompressionMode.Decompress);
 	                decompressedData = new byte[size];
 	                gzip.Read(decompressedData, 0, decompressedData.Length);
 	                gzip.Close();
