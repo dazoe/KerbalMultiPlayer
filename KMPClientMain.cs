@@ -3,18 +3,15 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Globalization;
-
 using System.Security.Cryptography;
 using System.Runtime.Serialization.Formatters.Binary;
-
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Diagnostics;
-
 using System.Collections;
-
 using KSP.IO;
+using Lidgren.Network;
 using UnityEngine;
 using System.Xml;
 
@@ -71,7 +68,8 @@ namespace KMP
 
         //public const String PLUGIN_DIRECTORY = "PluginData/kerbalmultiplayer/";
 
-        public static UnicodeEncoding encoder = new UnicodeEncoding();
+//        public static UnicodeEncoding encoder = new UnicodeEncoding();
+        public static Encoding encoder = Encoding.UTF8;
 
         //Settings
 
@@ -116,15 +114,18 @@ namespace KMP
         public static bool endSession;
         public static bool intentionalConnectionEnd;
         public static bool handshakeCompleted;
-        public static Socket tcpSocket;
+//        public static Socket tcpSocket;
         public static long lastTCPMessageSendTime;
         public static bool quitHelperMessageShow;
         public static int reconnectAttempts;
-        public static Socket udpSocket;
+//        public static Socket udpSocket;
         public static bool udpConnected;
         public static long lastUDPMessageSendTime;
         public static long lastUDPAckReceiveTime;
         public static long lastUDPProbeTime;
+        public static NetServer netServer;
+        public static NetConnection netConnection;
+        public static bool connected = false;
 
         public static bool receivedSettings;
 
@@ -594,7 +595,7 @@ namespace KMP
         /// Connect to the server and run a session until the connection ends
         /// </summary>
         /// <returns>True iff a connection was successfully established with the server</returns>
-        static bool connectionLoop()
+        private static bool connectionLoop()
         {
             //Look for a port-number in the hostname
             int port = DEFAULT_PORT;
@@ -610,11 +611,11 @@ namespace KMP
                 trimmed_hostname = hostname.Substring(0, port_start_index);
             }
 
-            //Look up the actual IP address
-            bool ipv6_connected = false;
+            //Get ip addresses
             IPAddress address = null;
-            IPAddress.TryParse(trimmed_hostname, out address);
-            if (address == null) {
+            IPAddress ipv6_Address = null;
+            if (!IPAddress.TryParse(trimmed_hostname, out address)) {
+            	//Gotta use DNS
                 IPHostEntry host_entry = new IPHostEntry();
                 try
                 {
@@ -627,170 +628,401 @@ namespace KMP
                 }
                 if (host_entry != null)
                 {
-                    IPAddress ipv4_address = Array.Find(host_entry.AddressList, a => a.AddressFamily == AddressFamily.InterNetwork);
-                    IPAddress ipv6_address = Array.Find(host_entry.AddressList, a => a.AddressFamily == AddressFamily.InterNetworkV6);
-                    address = ipv4_address;
-                    if ( ipv6_address != null ) {
-                        try {
-                            //Connects IPv6 Hostnames
-                            TcpClient ipv6_tcpClient = new TcpClient(ipv6_address.AddressFamily);
-                            ipv6_tcpClient.NoDelay = true;
-                            IPEndPoint ipv6_endpoint = new IPEndPoint(ipv6_address, port);
-                            SetMessage("Connecting to IPv6: [" + ipv6_address + "]:" + port);
-                            ipv6_tcpClient.Connect(ipv6_endpoint);
-                            if (ipv6_tcpClient.Client.Connected) {
-                                ipv6_connected = true;
-                                address = ipv6_address;
-                                tcpSocket = ipv6_tcpClient.Client;
-                            } else {
-                                ipv6_tcpClient = null;
-                                ipv6_endpoint = null;
-                            }
-                        }
-                        catch (Exception e) {
-                            Log.Debug("Exception thrown in connectionLoop(), catch 2, Exception: {0}", e.ToString());
-                        }
-                    }
+                	foreach (IPAddress addr in host_entry.AddressList) {
+                		if (addr.AddressFamily == AddressFamily.InterNetwork) {
+                			address = addr;
+                		} else if (addr.AddressFamily == AddressFamily.InterNetworkV6) {
+                			ipv6_Address = addr;
+                		}
+                	}
                 }
             }
-
-            if (address == null)
-            {
-                SetMessage("Invalid server address.");
-                return false;
-            }
-
-
             
-
-            try
-            {
-                //Connects IPv4 Hostnames, And IPv6/IPv4 IP's.
-                if (ipv6_connected == false) {
-                    TcpClient tcpClient = new TcpClient(address.AddressFamily);
-                    tcpClient.NoDelay = true;
-                    IPEndPoint endpoint = new IPEndPoint(address, port);
-                    if (address.AddressFamily == AddressFamily.InterNetworkV6) {
-                        SetMessage("Connecting to IPv6: [" + address + "]:" + port);
-                    } else {
-                        SetMessage("Connecting to IPv4: " + address + ":" + port);
-                    }
-                    tcpClient.Connect(endpoint);
-                    tcpSocket = tcpClient.Client;
-                }
-                //tcpSocket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.KeepAlive, true);
-                if (tcpSocket.Connected)
-                {
-                    SetMessage("TCP connection established");
-                    clientID = -1;
-                    endSession = false;
-                    intentionalConnectionEnd = false;
-                    handshakeCompleted = false;
-                    receivedSettings = false;
-
-                    pluginUpdateInQueue = new Queue<byte[]>();
-                    textMessageQueue = new Queue<InTextMessage>();
-                    lock (interopOutQueueLock)
-                    {
-                        interopOutQueue = new Queue<byte[]>();
-                    }
-                    interopInQueue = new Queue<byte[]>();
-
-                    receivedMessageQueue = new Queue<ServerMessage>();
-
-                    threadException = null;
-
-                    currentGameTitle = String.Empty;
-                    watchPlayerName = String.Empty;
-                    lastSharedScreenshot = null;
-                    lastScreenshotShareTime = 0;
-                    lastTCPMessageSendTime = 0;
-                    lastClientDataWriteTime = 0;
-                    lastClientDataChangeTime = stopwatch.ElapsedMilliseconds;
-
-                    quitHelperMessageShow = true;
-
-                    //Init udp socket
-                    try
-                    {
-                        IPEndPoint endpoint = new IPEndPoint(address, port);
-                        udpSocket = new Socket(endpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
-                        udpSocket.Connect(endpoint);
-                    }
-                    catch (Exception e)
-                    {
-                        Log.Debug("Exception thrown in connectionLoop(), catch 3, Exception: {0}", e.ToString());
-                        if (udpSocket != null)
-                            udpSocket.Close();
-
-                        udpSocket = null;
-                    }
-
-                    udpConnected = false;
-                    lastUDPAckReceiveTime = 0;
-                    lastUDPMessageSendTime = stopwatch.ElapsedMilliseconds;
-
-                    //Create a thread to handle chat
-                    chatThread = new Thread(new ThreadStart(handleChat));
-                    chatThread.Start();
-
-                    //Create a thread to handle client interop
-                    interopThread = new Thread(new ThreadStart(handlePluginInterop));
-                    interopThread.Start();
-
-                    //Create a thread to handle disconnection
-                    connectionThread = new Thread(new ThreadStart(handleConnection));
-                    connectionThreadRunning = true;
-                    connectionThread.Start();
-
-                    beginAsyncRead();
-
-                    SetMessage("Connected to server! Handshaking...");
-
-                    while (!endSession && !intentionalConnectionEnd && tcpSocket.Connected)
-                    {
-                        //Check for exceptions thrown by threads
-                        lock (threadExceptionLock)
-                        {
-                            if (threadException != null)
-                            {
-                                Exception e = threadException;
-                                threadExceptionStackTrace = e.StackTrace;
-                                throw e;
-                            }
-                        }
-
-                        Thread.Sleep(SLEEP_TIME);
-                    }
-
-                    //clearConnectionState();
-
-                    if (intentionalConnectionEnd)
-                        enqueuePluginChatMessage("Closed connection with server", true);
-                    else
-                        enqueuePluginChatMessage("Lost connection with server", true);
-                        ScreenMessages.PostScreenMessage("Lost connection with server. Please return to the Main Menu to reconnect.",300f,ScreenMessageStyle.UPPER_CENTER);
-
-                    return true;
-                }
-
-            }
-            catch (Exception e)
-            {
-                Log.Debug("Exception thrown in connectionLoop(), catch 4, Exception: {0}", e.ToString());
-                SetMessage("Disconnected");
-                if (tcpSocket != null)
-                   tcpSocket.Close();
-
-                tcpSocket = null;
+            if ((address == null) && (ipv6_Address == null)) {
+            	SetMessage("Invalid server address.");
+            	return false;
             }
 
+            NetPeerConfiguration netConfig;
+            if (ipv6_Address != null) {
+            	//First try ipv6....
+            	netConfig = new NetPeerConfiguration("KerbalMultiPlayer");
+            	netConfig.LocalAddress = IPAddress.IPv6Any;
+            	netConfig.EnableMessageType(NetIncomingMessageType.VerboseDebugMessage);
+            	NetServer ipv6_NetServer = new NetServer(netConfig);
+            	ipv6_NetServer.Start();
+            	ipv6_NetServer.Connect(new IPEndPoint(ipv6_Address, port));
+            	SetMessage("Connecting to IPv6: [" + ipv6_Address + "]:" + port);
+            	while (true) {
+            		NetIncomingMessage msg = ipv6_NetServer.ReadMessage();
+            		if (msg != null) {
+            			if (msg.MessageType == NetIncomingMessageType.StatusChanged) {
+            				NetConnectionStatus status = (NetConnectionStatus)msg.ReadByte();
+            				connected = (status == NetConnectionStatus.Connected);
+            				if (connected) {
+            					netServer = ipv6_NetServer;
+            				}
+            				break;
+            			}
+            		} else {
+            			Thread.Sleep(SLEEP_TIME);
+            		}
+            	}
+            }
+            if ((!connected) && (address != null)) {
+            	//Then try ipv4 / typed ipv6 addresses
+            	netConfig = new NetPeerConfiguration("KerbalMultiPlayer");
+            	netConfig.LocalAddress = (address.AddressFamily == AddressFamily.InterNetworkV6) ? IPAddress.IPv6Any : IPAddress.Any;
+            	netConfig.EnableMessageType(NetIncomingMessageType.VerboseDebugMessage);
+            	NetServer ipv4_NetServer = new NetServer(netConfig);
+            	ipv4_NetServer.Start();
+            	ipv4_NetServer.Connect(new IPEndPoint(address, port));
+            	if (address.AddressFamily == AddressFamily.InterNetworkV6) {
+            		SetMessage("Connecting to IPv6: [" + address + "]:" + port);
+            	} else {
+            		SetMessage("Connecting to IPv4: " + address + ":" + port);
+            	}
+            	bool doBreak = false;
+            	while (true) {
+            		NetIncomingMessage msg = ipv4_NetServer.ReadMessage();
+            		if (msg != null) {
+            			switch (msg.MessageType) {
+            				case NetIncomingMessageType.DebugMessage:
+            				case NetIncomingMessageType.ErrorMessage:
+            				case NetIncomingMessageType.VerboseDebugMessage:
+            				case NetIncomingMessageType.WarningMessage:
+            					Log.Debug("Connection {0}: {1}", Enum.GetName(msg.MessageType.GetType(), msg.MessageType), msg.ReadString());
+            					break;
+            				case NetIncomingMessageType.StatusChanged:
+            					NetConnectionStatus status = (NetConnectionStatus)msg.ReadByte();
+            					if (status == NetConnectionStatus.Connected) {
+            						connected = true;
+            						netConnection = msg.SenderConnection;
+            						netServer = ipv4_NetServer;
+            					}
+            					doBreak = true;
+            					Log.Debug("Connection status: {0} ({1})", Enum.GetName(status.GetType(), status), msg.ReadString());
+            					break;
+            				default:
+            					string exMsg = string.Format("Connection unhandled message type: {0}", Enum.GetName(msg.MessageType.GetType(), msg.MessageType));
+            					passExceptionToMain(new Exception(exMsg));
+            					Log.Debug("Connection unhandled message type: {0}", Enum.GetName(msg.MessageType.GetType(), msg.MessageType));
+            					break;
+            			}
+            			if (doBreak) break;
+            		} else {
+            			Thread.Sleep(SLEEP_TIME);
+            		}
+            	}
+            }
+            
+            if (connected) {
+            	SetMessage("Connection established");
+            	clientID = -1;
+            	endSession = false;
+            	intentionalConnectionEnd = false;
+            	handshakeCompleted = false;
+            	receivedSettings = false;
+            	
+            	pluginUpdateInQueue = new Queue<byte[]>();
+            	textMessageQueue = new Queue<InTextMessage>();
+            	lock (interopOutQueueLock)
+            	{
+            		interopOutQueue = new Queue<byte[]>();
+            	}
+            	interopInQueue = new Queue<byte[]>();
+            	
+            	receivedMessageQueue = new Queue<ServerMessage>();
+            	
+            	threadException = null;
+            	
+            	currentGameTitle = String.Empty;
+            	watchPlayerName = String.Empty;
+            	lastSharedScreenshot = null;
+            	lastScreenshotShareTime = 0;
+            	lastTCPMessageSendTime = 0;
+            	lastClientDataWriteTime = 0;
+            	lastClientDataChangeTime = stopwatch.ElapsedMilliseconds;
+            	
+            	quitHelperMessageShow = true;
+            	
+            	lastUDPAckReceiveTime = 0;
+            	lastUDPMessageSendTime = stopwatch.ElapsedMilliseconds;
+            	
+            	//Create a thread to handle chat
+            	chatThread = new Thread(new ThreadStart(handleChat));
+            	chatThread.Start();
+            	
+            	//Create a thread to handle client interop
+            	interopThread = new Thread(new ThreadStart(handlePluginInterop));
+            	interopThread.Start();
+            	
+            	//Create a thread to handle disconnection
+            	connectionThread = new Thread(new ThreadStart(handleConnection));
+            	connectionThreadRunning = true;
+            	connectionThread.Start();
+            	
+            	SetMessage("Connected to server! Handshaking...");
+           		NetIncomingMessage msg;
+            	
+            	while (!endSession && !intentionalConnectionEnd && connected)
+            	{
+            		//Check for exceptions thrown by threads
+            		lock (threadExceptionLock)
+            		{
+            			if (threadException != null)
+            			{
+            				Exception e = threadException;
+            				threadExceptionStackTrace = e.StackTrace;
+            				throw e;
+            			}
+            		}
+            		
+            		if ((msg = netServer.ReadMessage()) != null) {
+            			switch (msg.MessageType) {
+            				case NetIncomingMessageType.DebugMessage:
+            				case NetIncomingMessageType.ErrorMessage:
+            				case NetIncomingMessageType.VerboseDebugMessage:
+            				case NetIncomingMessageType.WarningMessage:
+            					Log.Debug("Connection {0}: {1}", Enum.GetName(msg.MessageType.GetType(), msg.MessageType), msg.ReadString());
+            					break;
+            				case NetIncomingMessageType.StatusChanged:
+            					NetConnectionStatus status = (NetConnectionStatus)msg.ReadByte();
+            					Log.Debug("Connection status: {0} ({1})", Enum.GetName(status.GetType(), status), msg.ReadString());
+            					if (status == NetConnectionStatus.Disconnected) {
+            						connected = false;
+            						//Do we need to do more?
+            					}
+            					break;
+            				case NetIncomingMessageType.Data:
+            					KMPCommon.ServerMessageID msgId = (KMPCommon.ServerMessageID)msg.ReadInt32();
+            					byte[] msgData = null;
+            					if (msg.LengthBytes > 4)
+            						msgData = KMPCommon.Decompress(msg.ReadBytes(msg.LengthBytes - 4));
+            					messageReceived(msgId, msgData);
+            					break;
+            				default:
+            					Log.Debug("Connection unhandled message type: {0}", Enum.GetName(msg.MessageType.GetType(), msg.MessageType));
+            					break;
+            			}
+            		}
+
+            		Thread.Sleep(SLEEP_TIME);
+            	}
+            	
+            	//clearConnectionState();
+            	
+            	if (intentionalConnectionEnd)
+            		enqueuePluginChatMessage("Closed connection with server", true);
+            	else
+            		enqueuePluginChatMessage("Lost connection with server", true);
+            	ScreenMessages.PostScreenMessage("Lost connection with server. Please return to the Main Menu to reconnect.",300f,ScreenMessageStyle.UPPER_CENTER);
+            	
+            	return true;
+            }
+            SetMessage("Connection fail");
             return false;
         }
 
+//        static bool connectionLoopOld()
+//        {
+//            //Look for a port-number in the hostname
+//            int port = DEFAULT_PORT;
+//            String trimmed_hostname = hostname;
+//
+//            int port_start_index = hostname.LastIndexOf(':');
+//            if (port_start_index >= 0 && port_start_index < (hostname.Length - 1))
+//            {
+//                String port_substring = hostname.Substring(port_start_index + 1);
+//                if (!int.TryParse(port_substring, out port) || port < IPEndPoint.MinPort || port > IPEndPoint.MaxPort)
+//                    port = DEFAULT_PORT;
+//
+//                trimmed_hostname = hostname.Substring(0, port_start_index);
+//            }
+//
+//            //Look up the actual IP address
+//            bool ipv6_connected = false;
+//            IPAddress address = null;
+//            IPAddress.TryParse(trimmed_hostname, out address);
+//            if (address == null) {
+//                IPHostEntry host_entry = new IPHostEntry();
+//                try
+//                {
+//                    host_entry = Dns.GetHostEntry(trimmed_hostname);
+//                }
+//                catch (Exception e)
+//                {
+//                    Log.Debug("Exception thrown in connectionLoop(), catch 1, Exception: {0}", e.ToString());
+//                    host_entry = null;
+//                }
+//                if (host_entry != null)
+//                {
+//                    IPAddress ipv4_address = Array.Find(host_entry.AddressList, a => a.AddressFamily == AddressFamily.InterNetwork);
+//                    IPAddress ipv6_address = Array.Find(host_entry.AddressList, a => a.AddressFamily == AddressFamily.InterNetworkV6);
+//                    address = ipv4_address;
+//                    if ( ipv6_address != null ) {
+//                        try {
+//                            //Connects IPv6 Hostnames
+//                            TcpClient ipv6_tcpClient = new TcpClient(ipv6_address.AddressFamily);
+//                            ipv6_tcpClient.NoDelay = true;
+//                            IPEndPoint ipv6_endpoint = new IPEndPoint(ipv6_address, port);
+//                            SetMessage("Connecting to IPv6: [" + ipv6_address + "]:" + port);
+//                            ipv6_tcpClient.Connect(ipv6_endpoint);
+//                            if (ipv6_tcpClient.Client.Connected) {
+//                                ipv6_connected = true;
+//                                address = ipv6_address;
+//                                tcpSocket = ipv6_tcpClient.Client;
+//                            } else {
+//                                ipv6_tcpClient = null;
+//                                ipv6_endpoint = null;
+//                            }
+//                        }
+//                        catch (Exception e) {
+//                            Log.Debug("Exception thrown in connectionLoop(), catch 2, Exception: {0}", e.ToString());
+//                        }
+//                    }
+//                }
+//            }
+//
+//            if (address == null)
+//            {
+//                SetMessage("Invalid server address.");
+//                return false;
+//            }
+//
+//
+//            
+//
+//            try
+//            {
+//                //Connects IPv4 Hostnames, And IPv6/IPv4 IP's.
+//                if (ipv6_connected == false) {
+//                    TcpClient tcpClient = new TcpClient(address.AddressFamily);
+//                    tcpClient.NoDelay = true;
+//                    IPEndPoint endpoint = new IPEndPoint(address, port);
+//                    if (address.AddressFamily == AddressFamily.InterNetworkV6) {
+//                        SetMessage("Connecting to IPv6: [" + address + "]:" + port);
+//                    } else {
+//                        SetMessage("Connecting to IPv4: " + address + ":" + port);
+//                    }
+//                    tcpClient.Connect(endpoint);
+//                    tcpSocket = tcpClient.Client;
+//                }
+//                //tcpSocket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.KeepAlive, true);
+//                if (tcpSocket.Connected)
+//                {
+//                    SetMessage("TCP connection established");
+//                    clientID = -1;
+//                    endSession = false;
+//                    intentionalConnectionEnd = false;
+//                    handshakeCompleted = false;
+//                    receivedSettings = false;
+//
+//                    pluginUpdateInQueue = new Queue<byte[]>();
+//                    textMessageQueue = new Queue<InTextMessage>();
+//                    lock (interopOutQueueLock)
+//                    {
+//                        interopOutQueue = new Queue<byte[]>();
+//                    }
+//                    interopInQueue = new Queue<byte[]>();
+//
+//                    receivedMessageQueue = new Queue<ServerMessage>();
+//
+//                    threadException = null;
+//
+//                    currentGameTitle = String.Empty;
+//                    watchPlayerName = String.Empty;
+//                    lastSharedScreenshot = null;
+//                    lastScreenshotShareTime = 0;
+//                    lastTCPMessageSendTime = 0;
+//                    lastClientDataWriteTime = 0;
+//                    lastClientDataChangeTime = stopwatch.ElapsedMilliseconds;
+//
+//                    quitHelperMessageShow = true;
+//
+//                    //Init udp socket
+//                    try
+//                    {
+//                        IPEndPoint endpoint = new IPEndPoint(address, port);
+//                        udpSocket = new Socket(endpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+//                        udpSocket.Connect(endpoint);
+//                    }
+//                    catch (Exception e)
+//                    {
+//                        Log.Debug("Exception thrown in connectionLoop(), catch 3, Exception: {0}", e.ToString());
+//                        if (udpSocket != null)
+//                            udpSocket.Close();
+//
+//                        udpSocket = null;
+//                    }
+//
+//                    udpConnected = false;
+//                    lastUDPAckReceiveTime = 0;
+//                    lastUDPMessageSendTime = stopwatch.ElapsedMilliseconds;
+//
+//                    //Create a thread to handle chat
+//                    chatThread = new Thread(new ThreadStart(handleChat));
+//                    chatThread.Start();
+//
+//                    //Create a thread to handle client interop
+//                    interopThread = new Thread(new ThreadStart(handlePluginInterop));
+//                    interopThread.Start();
+//
+//                    //Create a thread to handle disconnection
+//                    connectionThread = new Thread(new ThreadStart(handleConnection));
+//                    connectionThreadRunning = true;
+//                    connectionThread.Start();
+//
+//                    beginAsyncRead();
+//
+//                    SetMessage("Connected to server! Handshaking...");
+//
+//                    while (!endSession && !intentionalConnectionEnd && tcpSocket.Connected)
+//                    {
+//                        //Check for exceptions thrown by threads
+//                        lock (threadExceptionLock)
+//                        {
+//                            if (threadException != null)
+//                            {
+//                                Exception e = threadException;
+//                                threadExceptionStackTrace = e.StackTrace;
+//                                throw e;
+//                            }
+//                        }
+//
+//                        Thread.Sleep(SLEEP_TIME);
+//                    }
+//
+//                    //clearConnectionState();
+//
+//                    if (intentionalConnectionEnd)
+//                        enqueuePluginChatMessage("Closed connection with server", true);
+//                    else
+//                        enqueuePluginChatMessage("Lost connection with server", true);
+//                        ScreenMessages.PostScreenMessage("Lost connection with server. Please return to the Main Menu to reconnect.",300f,ScreenMessageStyle.UPPER_CENTER);
+//
+//                    return true;
+//                }
+//
+//            }
+//            catch (Exception e)
+//            {
+//                Log.Debug("Exception thrown in connectionLoop(), catch 4, Exception: {0}", e.ToString());
+//                SetMessage("Disconnected");
+//                if (tcpSocket != null)
+//                   tcpSocket.Close();
+//
+//                tcpSocket = null;
+//            }
+//
+//            return false;
+//        }
+
         static void handleMessage(KMPCommon.ServerMessageID id, byte[] data)
         {
-            //LogAndShare("Message ID: " + id.ToString() + " data: " + (data == null ? "0" : System.Text.Encoding.ASCII.GetString(data)));
+            Log.Debug("Handling Message ID: " + id.ToString());
+            if (data != null)
+	            Log.Debug("Bytes: " + data.Length);
             switch (id)
             {
                 case KMPCommon.ServerMessageID.HANDSHAKE:
@@ -1091,13 +1323,11 @@ namespace KMP
 
                 Log.Debug("Closing connections...");
                 //Close the socket if it's still open
-                if (tcpSocket != null)
-                    tcpSocket.Close();
-                tcpSocket = null;
-
-                if (udpSocket != null)
-                    udpSocket.Close();
-                udpSocket = null;
+                if (netServer != null)
+                	netServer.Shutdown("clear connection state");
+                netServer = null;
+                netConnection = null;
+                connected = false;
             }
             catch (ThreadAbortException e) {
                 Log.Debug("Exception thrown in clearConnectionState(), catch 1, Exception: {0}", e.ToString());
@@ -1470,8 +1700,10 @@ namespace KMP
                     }
 
                     //Send a keep-alive message to prevent timeout
-                    if (stopwatch.ElapsedMilliseconds - lastTCPMessageSendTime >= KEEPALIVE_DELAY)
+                    if (stopwatch.ElapsedMilliseconds - lastTCPMessageSendTime >= KEEPALIVE_DELAY) {
+                    	Log.Debug("Sending keepalive: {0}", lastTCPMessageSendTime);
                         sendMessageTCP(KMPCommon.ClientMessageID.KEEPALIVE, null);
+                    }
 
                     //Handle received messages
                     while (receivedMessageQueue.Count > 0)
@@ -1481,7 +1713,7 @@ namespace KMP
                         handleMessage(message.id, message.data);
                     }
 
-                    if (udpSocket != null && handshakeCompleted)
+                    if (handshakeCompleted)
                     {
 
                         //Update the status of the udp connection
@@ -1639,7 +1871,7 @@ namespace KMP
             {
                 try
                 {
-                    while (interopInQueue.Count > 0 && tcpSocket.Connected)
+                    while (interopInQueue.Count > 0 && connected)
                     {
                         byte[] bytes;
                         bytes = interopInQueue.Dequeue();
@@ -1797,7 +2029,7 @@ namespace KMP
 
                     if (data != null && data.Length >= 9)
                     {
-                        UnicodeEncoding encoder = new UnicodeEncoding();
+//                        UnicodeEncoding encoder = new UnicodeEncoding();
                         int index = 0;
 
                         //Read current activity status
@@ -2161,21 +2393,17 @@ namespace KMP
 
         //Messages
 
-        private static void beginAsyncRead()
-        {
+        private static void beginAsyncRead() {
             try
             {
-                if (tcpSocket != null)
+                if (netServer != null)
                 {
                     currentMessageHeaderIndex = 0;
                     currentMessageDataIndex = 0;
                     receiveIndex = 0;
                     receiveHandleIndex = 0;
 
-                    StateObject state = new StateObject();
-                    state.workSocket = tcpSocket;
-                    tcpSocket.BeginReceive(state.buffer, 0, StateObject.BufferSize, 0,
-                        new AsyncCallback(ReceiveCallback), state);
+                    netServer.RegisterReceivedCallback(new SendOrPostCallback(ReceiveCallback));
                 }
             }
             catch (KSP.IO.IOException e)
@@ -2192,8 +2420,68 @@ namespace KMP
                 passExceptionToMain(e);
             }
         }
+//        private static void beginAsyncReadOld()
+//        {
+//            try
+//            {
+//                if (tcpSocket != null)
+//                {
+//                    currentMessageHeaderIndex = 0;
+//                    currentMessageDataIndex = 0;
+//                    receiveIndex = 0;
+//                    receiveHandleIndex = 0;
+//
+//                    StateObject state = new StateObject();
+//                    state.workSocket = tcpSocket;
+//                    tcpSocket.BeginReceive(state.buffer, 0, StateObject.BufferSize, 0,
+//                        new AsyncCallback(ReceiveCallback), state);
+//                }
+//            }
+//            catch (KSP.IO.IOException e)
+//            {
+//                Log.Debug("Exception thrown in beginAsyncRead(), catch 1, Exception: {0}", e.ToString());
+//            }
+//            catch (InvalidOperationException e)
+//            {
+//                Log.Debug("Exception thrown in beginAsyncRead(), catch 2, Exception: {0}", e.ToString());
+//            }
+//            catch (Exception e)
+//            {
+//                Log.Debug("Exception thrown in beginAsyncRead(), catch 3, Exception: {0}", e.ToString());
+//                passExceptionToMain(e);
+//            }
+//        }
 
-        private static void ReceiveCallback(IAsyncResult ar)
+        private static void ReceiveCallback(object sender) {
+        	if (sender is NetPeer) {
+        		NetPeer peer = (NetPeer)sender;
+        		NetIncomingMessage msg = peer.ReadMessage();
+        		switch (msg.MessageType) {
+        			case NetIncomingMessageType.DebugMessage:
+        			case NetIncomingMessageType.ErrorMessage:
+        			case NetIncomingMessageType.VerboseDebugMessage:
+        			case NetIncomingMessageType.WarningMessage:
+        				Log.Debug("Connection {0}: {1}", Enum.GetName(msg.MessageType.GetType(), msg.MessageType), msg.ReadString());
+        				break;
+        			case NetIncomingMessageType.StatusChanged:
+        				NetConnectionStatus status = (NetConnectionStatus)msg.ReadByte();
+        				//TODO: should do something here.
+        				Log.Debug("Connection status: {0} ({1})", Enum.GetName(status.GetType(), status), msg.ReadString());
+        				break;
+        			case NetIncomingMessageType.Data:
+        				KMPCommon.ServerMessageID msgId = (KMPCommon.ServerMessageID)msg.ReadInt32();
+        				byte[] msgData = null;
+        				if (msg.LengthBytes > 4)
+        					msgData = KMPCommon.Decompress(msg.ReadBytes(msg.LengthBytes - 4));
+        				messageReceived(msgId, msgData);
+        				break;
+        			default:
+        				Log.Debug("Connection unhandled message type: {0}", Enum.GetName(msg.MessageType.GetType(), msg.MessageType));
+        				break;
+        		}
+        	}
+        }
+        private static void ReceiveCallbackOld(IAsyncResult ar)
         {
             try
             {
@@ -2368,11 +2656,7 @@ namespace KMP
             {
                 KMPCommon.ClientMessageID id
                     = primary ? KMPCommon.ClientMessageID.PRIMARY_PLUGIN_UPDATE : KMPCommon.ClientMessageID.SECONDARY_PLUGIN_UPDATE;
-
-                if (udpConnected && data.Length < 100)
-                    sendMessageUDP(id, data);
-                else
-                    sendMessageTCP(id, data);
+                sendMessageUDP(id, data);
             }
         }
 		
@@ -2380,10 +2664,7 @@ namespace KMP
         {
             if (data != null && data.Length > 0)
             {
-                if (udpConnected && data.Length < 100)
-                    sendMessageUDP(KMPCommon.ClientMessageID.SCENARIO_UPDATE, data);
-                else
-                    sendMessageTCP(KMPCommon.ClientMessageID.SCENARIO_UPDATE, data);
+            	sendMessageUDP(KMPCommon.ClientMessageID.SCENARIO_UPDATE, data);
             }
         }
 		
@@ -2437,14 +2718,19 @@ namespace KMP
         {
             lock (tcpSendLock)
             {
-                byte[] message_bytes = buildMessageByteArray(id, data);
-                int send_bytes_actually_sent = 0;
-                while (send_bytes_actually_sent < message_bytes.Length)
-                {
+//                byte[] message_bytes = buildMessageByteArray(id, data);
                     try
                     {
                         //Send message
-                        send_bytes_actually_sent += tcpSocket.Send(message_bytes, send_bytes_actually_sent, message_bytes.Length - send_bytes_actually_sent, SocketFlags.None);
+                        NetOutgoingMessage msg = netConnection.Peer.CreateMessage();
+                        msg.Write((int)id);
+                        if (data != null) {
+                        	data = KMPCommon.Compress(data);
+                        	msg.Write(data);
+                        }
+                        Log.Debug("Connection sending message ID {0} ({1} bytes)", id.ToString(), (data != null) ? data.Length : 0);
+                        netConnection.SendMessage(msg, NetDeliveryMethod.ReliableOrdered, 0);
+//                        send_bytes_actually_sent += tcpSocket.Send(message_bytes, send_bytes_actually_sent, message_bytes.Length - send_bytes_actually_sent, SocketFlags.None);
                     //					Just do a blocking send
                     //					tcpSocket.BeginSend(message_bytes, 0, message_bytes.Length, SocketFlags.None,
                     //      					new AsyncCallback(SendCallback), tcpSocket); 
@@ -2455,8 +2741,6 @@ namespace KMP
                     catch (KSP.IO.IOException e) {
                         Log.Debug("Exception thrown in sendMessageTCP(), catch 2, Exception: {0}", e.ToString());
                     }
-
-                }
             }
             lastTCPMessageSendTime = stopwatch.ElapsedMilliseconds;
         }
@@ -2490,12 +2774,20 @@ namespace KMP
 
         private static void sendMessageUDP(KMPCommon.ClientMessageID id, byte[] data)
         {
-            if (udpSocket != null)
+            if (connected)
             {
                 //Send the packet
                 try
                 {
-                    udpSocket.Send(buildMessageByteArray(id, data, KMPCommon.intToBytes(clientID)));
+//                	byte[] message_data = buildMessageByteArray(id, data, KMPCommon.intToBytes(clientID));
+                	NetOutgoingMessage msg = netConnection.Peer.CreateMessage();
+                	msg.Write((int)id);
+                	if (data != null) {
+                		data = KMPCommon.Compress(data);
+                		msg.Write(data);
+                	}
+                	Log.Debug("Connection(udp) sending message ID {0} ({1} bytes)", id.ToString(), (data != null) ? data.Length : 0);
+                	netConnection.SendMessage(msg, NetDeliveryMethod.UnreliableSequenced, 1);
                 }
                 catch (Exception e) {
                     Log.Debug("Exception thrown in sendMessageUDP(), catch 1, Exception: {0}", e.ToString());

@@ -5,19 +5,16 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-
 using System.Net.Sockets;
 using System.Threading;
 using System.Net;
 using System.IO;
 using System.Diagnostics;
-
 using System.Collections;
-
 using System.Data;
 using System.Data.SQLite;
+using Lidgren.Network;
 using MySql.Data.MySqlClient;
-
 using KMP;
 using System.Data.Common;
 using System.Runtime.Serialization.Formatters.Binary;
@@ -66,7 +63,10 @@ namespace KMPServer
         public static object consoleWriteLock = new object();
 		public static object databaseVacuumLock = new object();
 
-        public Thread listenThread;
+		public static Encoding encoder = Encoding.UTF8;
+		
+        public Thread receiveThread;
+		public Thread listenThread;
         public Thread commandThread;
         public Thread connectionThread;
         public Thread outgoingMessageThread;
@@ -74,6 +74,7 @@ namespace KMPServer
 
         public Timer autoDekesslerTimer;
 
+        public NetServer netServer;
         public TcpListener tcpListener;
         public UdpClient udpClient;
 
@@ -160,7 +161,8 @@ namespace KMPServer
 
         public void clearState()
         {
-            safeAbort(listenThread);
+        	safeAbort(receiveThread);
+//        	safeAbort(listenThread);
             safeAbort(commandThread);
             safeAbort(connectionThread);
             safeAbort(outgoingMessageThread);
@@ -171,21 +173,22 @@ namespace KMPServer
                 foreach (Client client in clients.ToList())
                 {
                     client.endReceivingMessages();
-                    if (client.tcpClient != null)
-                        client.tcpClient.Close();
+                    if (client.netConnection != null)
+                    	client.netConnection.Disconnect("Server Clearing State");
                 }
             }
-
-            if (tcpListener != null)
-            {
-                try
-                {
-                    tcpListener.Stop();
-                }
-                catch (System.Net.Sockets.SocketException)
-                {
-                }
+            
+            if (netServer != null) {
+            	try
+            	{
+            		netServer.Shutdown("Server shutting down");
+            	}
+            	catch (Exception e)
+            	{
+            		Log.Debug("Should we ignore this: {0}", e.ToString());
+            	}
             }
+            netServer = null;
 
             if (httpListener != null)
             {
@@ -198,17 +201,6 @@ namespace KMPServer
                 {
                 }
             }
-
-            if (udpClient != null)
-            {
-                try
-                {
-                    udpClient.Close();
-                }
-                catch { }
-            }
-
-            udpClient = null;
 
             if (universeDB != null && (universeDB.State == ConnectionState.Open || settings.useMySQL))
             {
@@ -423,7 +415,8 @@ namespace KMPServer
             cleanupClients = new SynchronizedCollection<Client>(settings.maxClients);
             clientMessageQueue = new ConcurrentQueue<ClientMessage>();
 
-            listenThread = new Thread(new ThreadStart(listenForClients));
+            receiveThread = new Thread(new ThreadStart(receiveLoop));
+//            listenThread = new Thread(new ThreadStart(listenForClients));
             commandThread = new Thread(new ThreadStart(handleCommands));
             connectionThread = new Thread(new ThreadStart(handleConnections));
             outgoingMessageThread = new Thread(new ThreadStart(sendOutgoingMessages));
@@ -433,9 +426,16 @@ namespace KMPServer
             if (settings.ipBinding == "0.0.0.0" && settings.hostIPv6 == true) {
                 settings.ipBinding = "::";
             }
-            tcpListener = new TcpListener(IPAddress.Parse(settings.ipBinding), settings.port);
+
+            NetPeerConfiguration config = new NetPeerConfiguration("KerbalMultiPlayer");
+            config.LocalAddress = IPAddress.Parse(settings.ipBinding);
+            config.Port = settings.port;
+//            config.EnableMessageType(NetIncomingMessageType.VerboseDebugMessage);
+
+            netServer = new NetServer(config);
             
-            listenThread.Start();
+            receiveThread.Start();
+//            listenThread.Start();
 
             try
             {
@@ -821,9 +821,9 @@ namespace KMPServer
                 */
                 try
                 {
-                    if (client.tcpClient != null)
+                    if (client.netConnection != null)
                     {
-                        client.tcpClient.Close();
+                        client.netConnection.Disconnect("Server Clearing Clients");
 
                     }
                 }
@@ -1108,6 +1108,82 @@ namespace KMPServer
 
 
 
+        private void receiveLoop() {
+        	try {
+	        	Log.Info("Starting receive loop...");
+	        	netServer.Start();
+	        	while (true) {
+	        		NetIncomingMessage msg = netServer.ReadMessage();
+	        		if (msg != null) {
+	        			switch (msg.MessageType) {
+	        				case NetIncomingMessageType.DebugMessage:
+	        				case NetIncomingMessageType.ErrorMessage:
+	        				case NetIncomingMessageType.VerboseDebugMessage:
+	        				case NetIncomingMessageType.WarningMessage:
+	        					if (settings.LogLevel == Log.LogLevels.Debug)
+		        					Log.Debug("netServer {0}: {1}", Enum.GetName(msg.MessageType.GetType(), msg.MessageType), msg.ReadString());
+	        					break;
+	        				case NetIncomingMessageType.StatusChanged:
+	        					NetConnectionStatus status = (NetConnectionStatus)msg.ReadByte();
+	        					Log.Debug("netServer StatusChanged: {0} ({1})", Enum.GetName(status.GetType(), status), msg.ReadString());
+	        					if (status == NetConnectionStatus.Connected) {
+	        						peerConnected(msg.SenderConnection);
+	        					} else if (status == NetConnectionStatus.Disconnected) {
+	        						peerDisconnected(msg.SenderConnection);
+	        					}
+	        					//TODO: handle connects and reconnects...
+	        					break;
+	        				case NetIncomingMessageType.Data:
+	        					if (msg.SenderConnection.Tag is Client) {
+	        						KMPCommon.ClientMessageID msgId = (KMPCommon.ClientMessageID)msg.ReadInt32();
+	        						byte[] msgData = null;
+	        						if (msg.LengthBytes > 4)
+	        							msgData = KMPCommon.Decompress(msg.ReadBytes(msg.LengthBytes - 4));
+	        						Client c = (Client)msg.SenderConnection.Tag;
+	        						c.updateReceiveTimestamp();
+	        						queueClientMessage(c, msgId, msgData);
+	        					} else {
+	        						Log.Debug("Connection ignoring {0} bytes from unknown connection", msg.LengthBytes);
+	        					}
+	        					break;
+	        				default:
+	        					Log.Debug("Connection unhandled message type: {0}", Enum.GetName(msg.MessageType.GetType(), msg.MessageType));
+	        					break;
+	        			}
+	        		}
+	        		Thread.Sleep(SLEEP_TIME);
+	        	}
+        	} catch (ThreadAbortException) {}
+        	catch (Exception e) {
+                passExceptionToMain(e);
+        	}
+        }
+        private void peerDisconnected(NetConnection connection) {
+        	//TODO: handle disconnects!
+        }
+        private void peerConnected(NetConnection connection) {
+        	Client client = addClient(connection);
+        	if (client != null) {
+        		if (client.isValid) {
+        			//Send a handshake to the client
+        			Log.Info("Accepted client from {0}. Handshaking...", client.netConnection.RemoteEndPoint.ToString());
+        			sendHandshakeMessage(client);
+        			
+        			sendMessageDirect(client.netConnection, KMPCommon.ServerMessageID.NULL, null);
+        			
+        			//Send the join message to the client
+        			if (settings.joinMessage.Length > 0)
+        				sendServerMessage(client, settings.joinMessage);
+        		} else {
+        			Log.Info("Client attempted to connect, but connection was lost.");
+        		}
+        	} else {
+        		Log.Info("Client attempted to connect, but server is full.");
+        		sendHandshakeRefusalMessageDirect(connection, "Server is currently full");
+        		connection.Disconnect("Server is currently full (disconnect)");
+        	}
+        }
+
         private void listenForClients()
         {
             Thread.CurrentThread.CurrentCulture = new CultureInfo("en-GB");
@@ -1143,7 +1219,7 @@ namespace KMPServer
                     {
                         Log.Info("Client TCP connection established...");
                         //Try to add the client
-                        Client cl = addClient(client);
+                        Client cl = addClientOld(client);
                         if (cl != null)
                         {
                             if (cl.isValid)
@@ -1152,7 +1228,7 @@ namespace KMPServer
                                 Log.Info("Accepted client from {0}. Handshaking...", client.Client.RemoteEndPoint.ToString());
                                 sendHandshakeMessage(cl);
 
-                                sendMessageDirect(client, KMPCommon.ServerMessageID.NULL, null);
+//                                sendMessageDirect(client, KMPCommon.ServerMessageID.NULL, null);
 
                                 //Send the join message to the client
                                 if (settings.joinMessage.Length > 0)
@@ -1170,7 +1246,7 @@ namespace KMPServer
                         {
                             //Client array is full
                             Log.Info("Client attempted to connect, but server is full.");
-                            sendHandshakeRefusalMessageDirect(client, "Server is currently full");
+//                            sendHandshakeRefusalMessageDirect(client, "Server is currently full");
                             client.Close();
                         }
                     }
@@ -1331,15 +1407,27 @@ namespace KMPServer
 
         //Clients
 
-        private Client addClient(TcpClient tcp_client)
+        private Client addClient(NetConnection connection) {
+        	if (activeClientCount() >= settings.maxClients)
+        		return null;
+        	Client newClient = new Client(this);
+        	newClient.netConnection = connection;
+        	connection.Tag = newClient;
+        	newClient.resetProperties();
+        	clients.Add(newClient);
+        	newClient.clientIndex = this.clientIndex++; //Assign unique clientIndex to each client
+        	return newClient;
+        }
+
+        private Client addClientOld(TcpClient tcp_client)
         {
 
             if (tcp_client == null || !tcp_client.Connected || activeClientCount() >= settings.maxClients)
                 return null;
             Client newClient = new Client(this);
-            newClient.tcpClient = tcp_client;
+//            newClient.tcpClient = tcp_client;
             newClient.resetProperties();
-            newClient.startReceivingMessages();
+//            newClient.startReceivingMessages();
             clients.Add(newClient);
             newClient.clientIndex = this.clientIndex++; //Assign unique clientIndex to each client
             return newClient;
@@ -1350,16 +1438,16 @@ namespace KMPServer
             try
             {
                 //Send a message to client informing them why they were disconnected
-                if (cl.tcpClient != null)
+                if (cl.netConnection != null)
                 {
-                    if (cl.tcpClient.Connected)
-                        sendConnectionEndMessageDirect(cl.tcpClient, message);
+                    if (cl.netConnection.Status == NetConnectionStatus.Connected)
+                        sendConnectionEndMessageDirect(cl.netConnection, message);
 
                     //Close the socket
                     lock (cl.tcpClientLock)
                     {
                         cl.endReceivingMessages();
-                        cl.tcpClient.Close();
+                        cl.netConnection.Disconnect(message);
                     }
                 }
 				
@@ -1389,7 +1477,7 @@ namespace KMPServer
 
                 foreach (Client client in clients.ToList())
                 {
-                    if (cl.currentSubspaceID == client.currentSubspaceID && client.tcpClient.Connected && cl.playerID != client.playerID)
+                	if (cl.currentSubspaceID == client.currentSubspaceID && (client.netConnection.Status == NetConnectionStatus.Connected) && cl.playerID != client.playerID)
                     {
                         emptySubspace = false;
                         break;
@@ -1428,13 +1516,13 @@ namespace KMPServer
             catch (NullReferenceException e)
             {
                 //Almost certainly need to be smarter about this.
-                cl.tcpClient = null;
+                cl.netConnection = null;
 
                 Log.Info("Internal error during disconnect: {0}", e.StackTrace);
             }
             catch (InvalidOperationException)
             {
-                cl.tcpClient = null;
+                cl.netConnection = null;
             }
 
             cl.receivedHandshake = false;
@@ -1523,7 +1611,7 @@ namespace KMPServer
                         if ((currentMillisecond - client.lastUDPACKTime) > UDP_ACK_THROTTLE)
                         {
                             //Acknowledge the client's message with a TCP message
-                            client.queueOutgoingMessage(KMPCommon.ServerMessageID.UDP_ACKNOWLEDGE, null);
+                            client.sendMessage(KMPCommon.ServerMessageID.UDP_ACKNOWLEDGE, null);
                             client.lastUDPACKTime = currentMillisecond;
                             client.updateReceiveTimestamp();
                         }
@@ -1633,7 +1721,7 @@ namespace KMPServer
 
 
                 //Send response
-                byte[] buffer = System.Text.Encoding.UTF8.GetBytes(response_builder.ToString());
+                byte[] buffer = encoder.GetBytes(response_builder.ToString());
                 response.ContentLength64 = buffer.LongLength;
                 response.OutputStream.Write(buffer, 0, buffer.Length);
                 response.OutputStream.Close();
@@ -1660,6 +1748,9 @@ namespace KMPServer
             message.id = id;
             message.data = data;
 
+//            if (message.id == KMPCommon.ClientMessageID.HANDSHAKE)
+//            	Debugger.Break();
+            
             clientMessageQueue.Enqueue(message);
         }
 
@@ -1680,12 +1771,10 @@ namespace KMPServer
 	            {
 	                //Log.Info("Message id: " + id.ToString() + " from client: " + cl + " data: " + (data != null ? data.Length.ToString() : "0"));
 	
-	                UnicodeEncoding encoder = new UnicodeEncoding();
-	
 	                switch (id)
 	                {
 	                    case KMPCommon.ClientMessageID.HANDSHAKE:
-	                        HandleHandshake(cl, data, encoder);
+	                        HandleHandshake(cl, data);
 	                        break;
 	                    case KMPCommon.ClientMessageID.PRIMARY_PLUGIN_UPDATE:
 	                    case KMPCommon.ClientMessageID.SECONDARY_PLUGIN_UPDATE:
@@ -1698,16 +1787,16 @@ namespace KMPServer
 	                        handleClientTextMessage(cl, encoder.GetString(data, 0, data.Length));
 	                        break;
 	                    case KMPCommon.ClientMessageID.SCREEN_WATCH_PLAYER:
-	                        HandleScreenWatchPlayer(cl, data, encoder);
+	                        HandleScreenWatchPlayer(cl, data);
 	                        break;
 	                    case KMPCommon.ClientMessageID.SCREENSHOT_SHARE:
 	                        HandleScreenshotShare(cl, data);
 	                        break;
 	                    case KMPCommon.ClientMessageID.CONNECTION_END:
-	                        HandleConnectionEnd(cl, data, encoder);
+	                        HandleConnectionEnd(cl, data);
 	                        break;
 	                    case KMPCommon.ClientMessageID.SHARE_CRAFT_FILE:
-	                        HandleShareCraftFile(cl, data, encoder);
+	                        HandleShareCraftFile(cl, data);
 	                        break;
 	                    case KMPCommon.ClientMessageID.ACTIVITY_UPDATE_IN_FLIGHT:
 	                        HandleActivityUpdateInFlight(cl);
@@ -1716,7 +1805,7 @@ namespace KMPServer
 	                        HandleActivityUpdateInGame(cl);
 	                        break;
 	                    case KMPCommon.ClientMessageID.PING:
-	                        cl.queueOutgoingMessage(KMPCommon.ServerMessageID.PING_REPLY, null);
+	                        cl.sendMessage(KMPCommon.ServerMessageID.PING_REPLY, null);
 	                        break;
 	                    case KMPCommon.ClientMessageID.UDP_PROBE:
 	                        HandleUDPProbe(cl, data);
@@ -1932,7 +2021,7 @@ namespace KMPServer
             cl.updateActivityLevel(Client.ActivityLevel.IN_FLIGHT);
         }
 
-        private void HandleShareCraftFile(Client cl, byte[] data, UnicodeEncoding encoder)
+        private void HandleShareCraftFile(Client cl, byte[] data)
         {
             if (!(data.Length > 8 && (data.Length - 8) <= KMPCommon.MAX_CRAFT_FILE_BYTES)) { return; }
 
@@ -1984,7 +2073,7 @@ namespace KMPServer
             }
         }
 
-        private void HandleConnectionEnd(Client cl, byte[] data, UnicodeEncoding encoder)
+        private void HandleConnectionEnd(Client cl, byte[] data)
         {
             String message = String.Empty;
             if (data != null)
@@ -2017,7 +2106,7 @@ namespace KMPServer
                 saveScreenshot(data, cl.username);
         }
 
-        private void HandleScreenWatchPlayer(Client cl, byte[] data, UnicodeEncoding encoder)
+        private void HandleScreenWatchPlayer(Client cl, byte[] data)
         {
             String watch_name = String.Empty;
 
@@ -2113,7 +2202,7 @@ namespace KMPServer
             }
         }
 
-        private void HandleHandshake(Client cl, byte[] data, UnicodeEncoding encoder)
+        private void HandleHandshake(Client cl, byte[] data)
         {
             StringBuilder sb = new StringBuilder();
 
@@ -2598,24 +2687,30 @@ namespace KMPServer
             return message_bytes;
         }
 
-        private void sendMessageDirect(TcpClient client, KMPCommon.ServerMessageID id, byte[] data)
+        private void sendMessageDirect(NetConnection client, KMPCommon.ServerMessageID id, byte[] data)
         {
             try
             {
-                byte[] message_bytes = buildMessageArray(id, data);
-                client.GetStream().Write(message_bytes, 0, message_bytes.Length);
+                NetOutgoingMessage msg = client.Peer.CreateMessage();
+                msg.Write((int)id);
+				if (data != null) {
+					data = KMPCommon.Compress(data);
+					msg.Write(data);
+				}
+                client.SendMessage(msg, NetDeliveryMethod.ReliableOrdered, 0);
+//                client.GetStream().Write(message_bytes, 0, message_bytes.Length);
 
                 Log.Debug("Sending message: " + id.ToString());
             }
             catch { }
         }
 
-        private void sendHandshakeRefusalMessageDirect(TcpClient client, String message)
+        private void sendHandshakeRefusalMessageDirect(NetConnection client, String message)
         {
             try
             {
                 //Encode message
-                UnicodeEncoding encoder = new UnicodeEncoding();
+                
                 byte[] message_bytes = encoder.GetBytes(message);
 
                 sendMessageDirect(client, KMPCommon.ServerMessageID.HANDSHAKE_REFUSAL, message_bytes);
@@ -2631,15 +2726,14 @@ namespace KMPServer
             }
         }
 
-        private void sendConnectionEndMessageDirect(TcpClient client, String message)
+        private void sendConnectionEndMessageDirect(NetConnection connection, String message)
         {
             try
             {
                 //Encode message
-                UnicodeEncoding encoder = new UnicodeEncoding();
                 byte[] message_bytes = encoder.GetBytes(message);
 
-                sendMessageDirect(client, KMPCommon.ServerMessageID.CONNECTION_END, message_bytes);
+                sendMessageDirect(connection, KMPCommon.ServerMessageID.CONNECTION_END, message_bytes);
             }
             catch (System.IO.IOException)
             {
@@ -2655,9 +2749,6 @@ namespace KMPServer
         private void sendHandshakeMessage(Client cl)
         {
             //Encode version string
-            UnicodeEncoding encoder = new UnicodeEncoding();
-            
-
 
             byte[] version_bytes = encoder.GetBytes(KMPCommon.PROGRAM_VERSION);
 
@@ -2681,62 +2772,55 @@ namespace KMPServer
             KMPCommon.intToBytes(kmpModControl.Length).CopyTo(data_bytes, 16 + version_bytes.Length);
             kmpModControl.CopyTo(data_bytes, 20 + version_bytes.Length);
 
-            cl.queueOutgoingMessage(KMPCommon.ServerMessageID.HANDSHAKE, data_bytes);
+            cl.sendMessage(KMPCommon.ServerMessageID.HANDSHAKE, data_bytes);
         }
 
         private void sendServerMessageToAll(String message, Client exclude = null)
         {
-            UnicodeEncoding encoder = new UnicodeEncoding();
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.SERVER_MESSAGE, encoder.GetBytes(message));
+            byte[] message_bytes = encoder.GetBytes(message);
 
             foreach (var client in clients.ToList().Where(cl => cl.isReady && cl != exclude))
             {
-                client.queueOutgoingMessage(message_bytes);
+            	client.sendMessage(KMPCommon.ServerMessageID.SERVER_MESSAGE, message_bytes);
             }
             Log.Debug("[Server] message sent to all.");
         }
 
         private void sendServerMessage(Client cl, String message)
         {
-            UnicodeEncoding encoder = new UnicodeEncoding();
-            cl.queueOutgoingMessage(KMPCommon.ServerMessageID.SERVER_MESSAGE, encoder.GetBytes(message));
+        	cl.sendMessage(KMPCommon.ServerMessageID.SERVER_MESSAGE, encoder.GetBytes(message));
         }
 
         private void sendTextMessageToAll(String message, Client exclude = null)
         {
-            UnicodeEncoding encoder = new UnicodeEncoding();
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.TEXT_MESSAGE, encoder.GetBytes(message));
+            byte[] message_bytes = encoder.GetBytes(message);
 
             foreach (var client in clients.ToList().Where(cl => cl.isReady && cl != exclude))
             {
-                client.queueOutgoingMessage(message_bytes);
+            	client.sendMessage(KMPCommon.ServerMessageID.TEXT_MESSAGE, message_bytes);
             }
         }
 
         public void sendTextMessageToAdmins(String message, Client exclude = null)
         {
-            UnicodeEncoding encoder = new UnicodeEncoding();
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.TEXT_MESSAGE, encoder.GetBytes(message));
+            byte[] message_bytes = encoder.GetBytes(message);
 
             foreach (var client in clients.ToList().Where(cl => cl.isReady && cl != exclude && isAdmin(cl.username)))
             {
-                client.queueOutgoingMessage(message_bytes);
+            	client.sendMessage(KMPCommon.ServerMessageID.TEXT_MESSAGE, message_bytes);
             }
         }
 
         private void sendTextMessage(Client cl, String message)
         {
-            UnicodeEncoding encoder = new UnicodeEncoding();
-            cl.queueOutgoingMessage(KMPCommon.ServerMessageID.SERVER_MESSAGE, encoder.GetBytes(message));
+        	cl.sendMessage(KMPCommon.ServerMessageID.SERVER_MESSAGE, encoder.GetBytes(message));
         }
 
 		private void sendMotdMessage(Client cl, String message)
 		{
-			UnicodeEncoding encoder = new UnicodeEncoding();
-
             foreach (var line in message.Split(new string[] { @"\n" }, StringSplitOptions.None))
             {
-                cl.queueOutgoingMessage(KMPCommon.ServerMessageID.MOTD_MESSAGE, encoder.GetBytes(line));
+            	cl.sendMessage(KMPCommon.ServerMessageID.MOTD_MESSAGE, encoder.GetBytes(line));
             }
 		}
 
@@ -2846,7 +2930,7 @@ namespace KMPServer
                                     bool emptySubspace = true;
                                     foreach (Client client in clients.ToList())
                                     {
-                                        if (client != null && current_subspace == client.currentSubspaceID && client.tcpClient.Connected)
+                                    	if (client != null && current_subspace == client.currentSubspaceID && (client.netConnection.Status == NetConnectionStatus.Connected))
                                         {
                                             emptySubspace = false;
                                             break;
@@ -2929,7 +3013,7 @@ namespace KMPServer
                                     bool emptySubspace = true;
                                     foreach (Client client in clients.ToList())
                                     {
-                                        if (client != null && current_subspace == client.currentSubspaceID && client.tcpClient.Connected)
+                                    	if (client != null && current_subspace == client.currentSubspaceID && (client.netConnection.Status == NetConnectionStatus.Connected))
                                         {
                                             emptySubspace = false;
                                             break;
@@ -3064,11 +3148,6 @@ namespace KMPServer
 			
 			if (settings.useMySQL) universeDB.Close();
 			
-            //Build the message array
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.PLUGIN_UPDATE, data);
-            byte[] owned_message_bytes = buildMessageArray(KMPCommon.ServerMessageID.PLUGIN_UPDATE, owned_data);
-            byte[] past_message_bytes = buildMessageArray(KMPCommon.ServerMessageID.PLUGIN_UPDATE, past_data);
-
             foreach (var client in clients.ToList().Where(c => c != cl && c.isReady && c.activityLevel != Client.ActivityLevel.INACTIVE))
             {
                 if ((client.currentSubspaceID == cl.currentSubspaceID)
@@ -3076,16 +3155,16 @@ namespace KMPServer
                     && (cl.activityLevel == Client.ActivityLevel.IN_GAME || cl.lastTick > 0d))
                 {
                     if (OwnerID == client.playerID)
-                        client.queueOutgoingMessage(owned_message_bytes);
+                    	client.sendMessage(KMPCommon.ServerMessageID.PLUGIN_UPDATE, owned_data);
                     else
-                        client.queueOutgoingMessage(message_bytes);
+                    	client.sendMessage(KMPCommon.ServerMessageID.PLUGIN_UPDATE, data);
                 }
                 else if (!secondaryUpdate
 						&& !client.warping && !cl.warping
 				     	&& (cl.activityLevel == Client.ActivityLevel.IN_GAME || cl.lastTick > 0d)
                      	&& firstSubspaceIsPresentOrFutureOfSecondSubspace(client.currentSubspaceID, cl.currentSubspaceID))
                 {
-                    client.queueOutgoingMessage(past_message_bytes);
+            		client.sendMessage(KMPCommon.ServerMessageID.PLUGIN_UPDATE, past_data);
                 }
                 else if (!secondaryUpdate && (cl.activityLevel == Client.ActivityLevel.IN_GAME || cl.lastTick > 0d))
                 {
@@ -3100,8 +3179,7 @@ namespace KMPServer
                         }
                         infoOnly_data = ObjectToByteArray(vessel_info);
                     }
-                    byte[] infoOnly_message_bytes = buildMessageArray(KMPCommon.ServerMessageID.PLUGIN_UPDATE, infoOnly_data);
-                    client.queueOutgoingMessage(infoOnly_message_bytes);
+                    client.sendMessage(KMPCommon.ServerMessageID.PLUGIN_UPDATE, infoOnly_data);
                 }
             }
         }
@@ -3214,13 +3292,12 @@ namespace KMPServer
         private void sendScreenshot(Client cl, byte[] bytes)
         {
             Log.Info("Sending screenshot to player {0}", cl.username);
-            cl.queueOutgoingMessage(KMPCommon.ServerMessageID.SCREENSHOT_SHARE, bytes);
+            cl.sendMessage(KMPCommon.ServerMessageID.SCREENSHOT_SHARE, bytes);
         }
 
         private void sendScreenshotToWatchers(Client cl, byte[] bytes)
         {
             //Build the message and send it to all watchers
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.SCREENSHOT_SHARE, bytes);
             foreach (var client in clients.ToList().Where(c => c != cl && c.isReady && c.activityLevel != Client.ActivityLevel.INACTIVE))
             {
                 bool match = false;
@@ -3231,14 +3308,12 @@ namespace KMPServer
                 }
 
                 if (match)
-                    client.queueOutgoingMessage(message_bytes);
+                	client.sendMessage(KMPCommon.ServerMessageID.SCREENSHOT_SHARE, bytes);
             }
         }
 
         private void sendCraftFile(Client cl, String craft_name, byte[] data, KMPCommon.CraftType type)
         {
-
-            UnicodeEncoding encoder = new UnicodeEncoding();
             byte[] name_bytes = encoder.GetBytes(craft_name);
 
             byte[] bytes = new byte[8 + name_bytes.Length + data.Length];
@@ -3249,24 +3324,23 @@ namespace KMPServer
             name_bytes.CopyTo(bytes, 8);
             data.CopyTo(bytes, 8 + name_bytes.Length);
 
-            cl.queueOutgoingMessage(KMPCommon.ServerMessageID.CRAFT_FILE, bytes);
+            cl.sendMessage(KMPCommon.ServerMessageID.CRAFT_FILE, bytes);
         }
 
         private void sendServerSettingsToAll()
         {
             //Build the message array
             byte[] setting_bytes = serverSettingBytes();
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.SERVER_SETTINGS, setting_bytes);
 
             foreach (var client in clients.ToList().Where(c => c.isValid))
             {
-                client.queueOutgoingMessage(message_bytes);
+            	client.sendMessage(KMPCommon.ServerMessageID.SERVER_SETTINGS, setting_bytes);
             }
         }
 
         private void sendServerSettings(Client cl)
         {
-            cl.queueOutgoingMessage(KMPCommon.ServerMessageID.SERVER_SETTINGS, serverSettingBytes());
+            cl.sendMessage(KMPCommon.ServerMessageID.SERVER_SETTINGS, serverSettingBytes());
         }
 		
 		private void sendScenarios(Client cl)
@@ -3303,26 +3377,22 @@ namespace KMPServer
         private void sendSyncMessage(Client cl, double tick)
         {
             //Log.Info("Time sync for: " + cl.username);
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.SYNC, BitConverter.GetBytes(tick));
-            cl.queueOutgoingMessage(message_bytes);
+            cl.sendMessage(KMPCommon.ServerMessageID.SYNC, BitConverter.GetBytes(tick));
         }
 		
         private void sendSyncCompleteMessage(Client cl)
         {
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.SYNC_COMPLETE, null);
-            cl.queueOutgoingMessage(message_bytes);
+            cl.sendMessage(KMPCommon.ServerMessageID.SYNC_COMPLETE, null);
         }
 
         private void sendVesselMessage(Client cl, byte[] data)
         {
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.PLUGIN_UPDATE, data);
-            cl.queueOutgoingMessage(message_bytes);
+            cl.sendMessage(KMPCommon.ServerMessageID.PLUGIN_UPDATE, data);
         }
 		
 		private void sendScenarioMessage(Client cl,  byte[] data)
         {
-            byte[] message_bytes = buildMessageArray(KMPCommon.ServerMessageID.SCENARIO_UPDATE, data);
-            cl.queueOutgoingMessage(message_bytes);
+            cl.sendMessage(KMPCommon.ServerMessageID.SCENARIO_UPDATE, data);
         }
 
         private byte[] serverSettingBytes()
@@ -3867,7 +3937,7 @@ namespace KMPServer
 
                     try
                     {
-                        client.tcpClient.Close();
+                    	client.netConnection.Disconnect("You are a ghost");
                     }
                     catch (Exception) { }
                     finally { foundGhost++; }

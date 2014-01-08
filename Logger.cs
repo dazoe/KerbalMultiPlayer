@@ -19,13 +19,21 @@ namespace KMP
             Error = 40,
         }
 
+        public static StreamWriter file;
         public static LogLevels MinLogLevel { get; set; }
 
+        private static void OpenLogFile() {
+        	file = new StreamWriter(File.Open("kmp.log", FileMode.Create, FileAccess.Write, FileShare.ReadWrite));
+        	file.AutoFlush = true;
+        }
         private static void WriteLog(LogLevels level, string format, params object[] args)
         {
-            if (level < MinLogLevel) { return; }
-
+        	if (file == null) OpenLogFile();
             string output = string.Format("[{0}] : {1}", level.ToString(), string.Format(format, args));
+            file.WriteLine(DateTime.Now.ToString("HH:mm:ss") + ": " + output);
+            file.Flush();
+
+            if (level < MinLogLevel) { return; }
 
             switch (level)
             {

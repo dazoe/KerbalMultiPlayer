@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using Lidgren.Network;
 using UnityEngine;
 using System.Xml.Serialization;
 using System.Collections;
@@ -88,7 +89,7 @@ namespace KMP
 		
 		public const ControlTypes BLOCK_ALL_CONTROLS = ControlTypes.ALL_SHIP_CONTROLS | ControlTypes.ACTIONS_ALL | ControlTypes.EVA_INPUT | ControlTypes.TIMEWARP | ControlTypes.MISC | ControlTypes.GROUPS_ALL | ControlTypes.CUSTOM_ACTION_GROUPS;
 		
-		public UnicodeEncoding encoder = new UnicodeEncoding();
+		public Encoding encoder = Encoding.UTF8;
 
 		public String playerName = String.Empty;
 		public byte inactiveVesselsPerUpdate = 0;
@@ -3652,7 +3653,7 @@ namespace KMP
 					);
 			}
 			
-			if (!KMPConnectionDisplay.windowEnabled && KMPClientMain.handshakeCompleted && KMPClientMain.tcpSocket != null)
+			if (!KMPConnectionDisplay.windowEnabled && KMPClientMain.handshakeCompleted && KMPClientMain.netConnection != null)
 			{
 				if(KMPInfoDisplay.infoDisplayActive && isGameHUDHidden == false)
 				{
@@ -3764,7 +3765,7 @@ namespace KMP
 					bool quit = GUILayout.Button("Quit",lockButtonStyle);
 					if (quit)
 					{
-						if (KMPClientMain.tcpSocket.Connected) {
+						if (KMPClientMain.netConnection.Status == NetConnectionStatus.Connected) {
 							KMPClientMain.sendConnectionEndMessage("Requested quit during sync");
 						}
 						KMPClientMain.endSession = true;
@@ -4011,9 +4012,9 @@ namespace KMP
 				KMPClientMain.verifyShipsDirectory();
 				isVerified = true;
 			}
-			if (KMPClientMain.handshakeCompleted && KMPClientMain.tcpSocket != null && !blockConnections)
+			if (KMPClientMain.handshakeCompleted && KMPClientMain.netConnection != null && !blockConnections)
 			{
-				if (KMPClientMain.tcpSocket.Connected && !gameRunning)
+				if ((KMPClientMain.netConnection.Status == NetConnectionStatus.Connected) && !gameRunning)
 				{
 					//Clear dictionaries
 					sentVessels_Situations.Clear();

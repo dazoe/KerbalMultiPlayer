@@ -2,12 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-
 using System.Net.Sockets;
 using System.Threading;
 using System.Net;
 using System.Collections;
 using System.Collections.Concurrent;
+using Lidgren.Network;
 
 namespace KMPServer
 {
@@ -60,7 +60,8 @@ namespace KMPServer
 		public long lastInFlightActivityTime;
 		public ActivityLevel activityLevel;
 
-		public TcpClient tcpClient;
+//		public TcpClient tcpClient;
+		public NetConnection netConnection;
 
 		public object tcpClientLock = new object();
 		public object timestampLock = new object();
@@ -98,42 +99,43 @@ namespace KMPServer
             get
             {
                // bool isConnected = false;
-                if (this.tcpClient != null && this.tcpClient.Connected)
+               if (this.netConnection != null && this.netConnection.Status == NetConnectionStatus.Connected)
                 {                   
-                    Socket clientSocket = this.tcpClient.Client;
-                    try
-                    {
-						if (receivedHandshake)
-						{
-							if ((parent.currentMillisecond - lastPollTime) > POLL_INTERVAL)
-							{
-							    lastPollTime = parent.currentMillisecond;
-								//Removed redundant "Socket.Available" check and increased the Poll "Timeout" from 10ms to 500ms - Dani
-								//Change SocketRead to SocketWrite. Also, no need for such high timeout.
-								return clientSocket.Poll(200000, SelectMode.SelectWrite);
-							}
-							else
-							{
-							    // They have max 10 seconds to get their shit together. 
-							    return true;
-							}
-						} else return true;
-                    }
-                    catch (SocketException)
-                    {
-                        // Unknown error
-                        return false;
-                    } catch (ObjectDisposedException)
-                    {
-                        // Socket closed
-                        return false;
-                    }
-                    catch (Exception ex)
-                    {
-                        // Shouldn't happen, pass up.
-                        parent.passExceptionToMain(ex);
-                    }
-                    
+//                    Socket clientSocket = this.tcpClient.Client;
+//                    try
+//                    {
+//						if (receivedHandshake)
+//						{
+//							if ((parent.currentMillisecond - lastPollTime) > POLL_INTERVAL)
+//							{
+//							    lastPollTime = parent.currentMillisecond;
+//							    
+//								//Removed redundant "Socket.Available" check and increased the Poll "Timeout" from 10ms to 500ms - Dani
+//								//Change SocketRead to SocketWrite. Also, no need for such high timeout.
+//								return clientSocket.Poll(200000, SelectMode.SelectWrite);
+//							}
+//							else
+//							{
+//							    // They have max 10 seconds to get their shit together. 
+//							    return true;
+//							}
+//						} else return true;
+//                    }
+//                    catch (SocketException)
+//                    {
+//                        // Unknown error
+//                        return false;
+//                    } catch (ObjectDisposedException)
+//                    {
+//                        // Socket closed
+//                        return false;
+//                    }
+//                    catch (Exception ex)
+//                    {
+//                        // Shouldn't happen, pass up.
+//                        parent.passExceptionToMain(ex);
+//                    }
+//                    
                     return true;
                 }
                 return false;
@@ -152,8 +154,8 @@ namespace KMPServer
         {
             get
             {
-                if (tcpClient == null) { return null; }
-                return (tcpClient.Client.RemoteEndPoint as IPEndPoint).Address;
+                if (netConnection == null) { return null; }
+                return netConnection.RemoteEndPoint.Address;
             }
         }
 
@@ -207,93 +209,114 @@ namespace KMPServer
 
 		//Async read
 
-		private void beginAsyncRead()
-		{
-			try
-			{
-				if (tcpClient != null)
-				{
-					currentMessageHeaderIndex = 0;
-					currentMessageDataIndex = 0;
-					receiveIndex = 0;
-					receiveHandleIndex = 0;
+//		private void beginAsyncRead()
+//		{
+//			try
+//			{
+//				if (tcpClient != null)
+//				{
+//					currentMessageHeaderIndex = 0;
+//					currentMessageDataIndex = 0;
+//					receiveIndex = 0;
+//					receiveHandleIndex = 0;
+//
+//					tcpClient.GetStream().BeginRead(
+//						receiveBuffer,
+//						receiveIndex,
+//						receiveBuffer.Length - receiveIndex,
+//						asyncReceive,
+//						receiveBuffer);
+//				}
+//			}
+//			catch (InvalidOperationException)
+//			{
+//				//parent.disconnectClient(this, "InvalidOperationException");
+//				Log.Debug("Caught InvalidOperationException for player " + this.username + " in beginAsyncRead");
+//				//parent.markClientForDisconnect(this);
+//			}
+//			catch (System.IO.IOException)
+//			{
+//                //parent.disconnectClient(this, "IOException");
+//				Log.Debug("Caught IOException for player " + this.username + " in beginAsyncRead");
+//				//parent.markClientForDisconnect(this);
+//			}
+//			catch (Exception e)
+//			{
+//				parent.passExceptionToMain(e);
+//			}
+//		}
 
-					tcpClient.GetStream().BeginRead(
-						receiveBuffer,
-						receiveIndex,
-						receiveBuffer.Length - receiveIndex,
-						asyncReceive,
-						receiveBuffer);
+		public void receivedBytes(byte[] data) {
+			try {
+				// grow the buffer?
+				Log.Debug("Client({0}) received {1} bytes", playerID, data.Length);
+				while ((receiveBuffer.Length - receiveIndex) < data.Length) {
+					byte[] oldBuffer = receiveBuffer;
+					receiveBuffer = new byte[receiveBuffer.Length*2];
+					oldBuffer.CopyTo(receiveBuffer, 0);
+					Log.Debug("Client({0}) growing buffer to {1} bytes", playerID, receiveBuffer.Length);
 				}
-			}
-			catch (InvalidOperationException)
-			{
-				//parent.disconnectClient(this, "InvalidOperationException");
-				Log.Debug("Caught InvalidOperationException for player " + this.username + " in beginAsyncRead");
-				//parent.markClientForDisconnect(this);
-			}
-			catch (System.IO.IOException)
-			{
-                //parent.disconnectClient(this, "IOException");
-				Log.Debug("Caught IOException for player " + this.username + " in beginAsyncRead");
-				//parent.markClientForDisconnect(this);
-			}
-			catch (Exception e)
-			{
+				data.CopyTo(receiveBuffer, receiveIndex);
+				receiveIndex += data.Length;
+				updateReceiveTimestamp();
+				handleReceive();
+				//TODO: netConnection.close()?
+			} catch (Exception e) {
 				parent.passExceptionToMain(e);
 			}
 		}
-
-		private void asyncReceive(IAsyncResult result)
-		{
-            try
-            {
-                if (tcpClient.Connected)
-                {
-                    var stream = tcpClient.GetStream();
-                    int read = stream.EndRead(result);
-
-                    if (read > 0)
-                    {
-                        receiveIndex += read;
-                        //Console.WriteLine("Got data: " + System.Text.Encoding.ASCII.GetString(receiveBuffer));
-                        updateReceiveTimestamp();
-                        handleReceive();
-                    }
-
-                    if (tcpClient.Connected)
-                    {
-                        tcpClient.GetStream().BeginRead(
-                            receiveBuffer,
-                            receiveIndex,
-                            receiveBuffer.Length - receiveIndex,
-                            asyncReceive,
-                            receiveBuffer);
-                    }
-                }
-                else
-                {
-                    tcpClient.Close();
-                }
-            }
-            catch (InvalidOperationException) {
-				//parent.disconnectClient(this, "InvalidOperationException");
-				Log.Debug("Caught InvalidOperationException for player " + this.username + " in asyncReceive");
-				//parent.markClientForDisconnect(this);
-			}
-            catch (System.IO.IOException) {
-				//parent.disconnectClient(this, "IOException");
-				Log.Debug("Caught IOException for player " + this.username + " in asyncReceive");
-				//parent.markClientForDisconnect(this);
-			}
-            catch (NullReferenceException) { } // ignore,  gets thrown after a disconnect
-            catch (ThreadAbortException) { }
-            catch (Exception e)
-            {
-                parent.passExceptionToMain(e);
-            }
-
-		}
+//		private void asyncReceive(IAsyncResult result)
+//		{
+//            try
+//            {
+//                if (tcpClient.Connected)
+//                {
+//                    var stream = tcpClient.GetStream();
+//                    int read = stream.EndRead(result);
+//
+//                    if (read > 0)
+//                    {
+//                        receiveIndex += read;
+//                        //Console.WriteLine("Got data: " + System.Text.Encoding.ASCII.GetString(receiveBuffer));
+//                        updateReceiveTimestamp();
+//                        handleReceive();
+//                    }
+//
+//                    if (tcpClient.Connected)
+//                    {
+//                    	NetworkStream s;
+//                    	s.BeginRead(
+//                        tcpClient.GetStream().BeginRead(
+//                            receiveBuffer,
+//                            receiveIndex,
+//                            receiveBuffer.Length - receiveIndex,
+//                            asyncReceive,
+//                            receiveBuffer);
+//                    }
+//                }
+//                else
+//                {
+//                    tcpClient.Close();
+//                }
+//            }
+//            catch (InvalidOperationException) {
+//				//parent.disconnectClient(this, "InvalidOperationException");
+//				Log.Debug("Caught InvalidOperationException for player " + this.username + " in asyncReceive");
+//				//parent.markClientForDisconnect(this);
+//			}
+//            catch (System.IO.IOException) {
+//				//parent.disconnectClient(this, "IOException");
+//				Log.Debug("Caught IOException for player " + this.username + " in asyncReceive");
+//				//parent.markClientForDisconnect(this);
+//			}
+//            catch (NullReferenceException) { } // ignore,  gets thrown after a disconnect
+//            catch (ThreadAbortException) { }
+//            catch (Exception e)
+//            {
+//                parent.passExceptionToMain(e);
+//            }
+//
+//		}
 
 		private void handleReceive()
 		{
@@ -390,37 +413,37 @@ namespace KMPServer
 
 		//Asyc send
 
-		private void asyncSend(IAsyncResult result)
-		{
-			try
-			{
-                if (tcpClient.Connected)
-                {
-                    tcpClient.GetStream().EndWrite(result);
-					isClientSendingData = false;
-					if (queuedOutMessagesHighPriority.Count > 0 || queuedOutMessages.Count > 0) {
-						sendOutgoingMessages();
-					}
-                }
-                else
-                {
-                    //Do we care?!
-                }
-			}
-			catch (InvalidOperationException)
-			{
-			}
-			catch (System.IO.IOException)
-			{
-			}
-			catch (ThreadAbortException)
-			{
-			}
-			catch (Exception e)
-			{
-				parent.passExceptionToMain(e);
-			}
-		}
+//		private void asyncSend(IAsyncResult result)
+//		{
+//			try
+//			{
+//                if (tcpClient.Connected)
+//                {
+//                    tcpClient.GetStream().EndWrite(result);
+//					isClientSendingData = false;
+//					if (queuedOutMessagesHighPriority.Count > 0 || queuedOutMessages.Count > 0) {
+//						sendOutgoingMessages();
+//					}
+//                }
+//                else
+//                {
+//                    //Do we care?!
+//                }
+//			}
+//			catch (InvalidOperationException)
+//			{
+//			}
+//			catch (System.IO.IOException)
+//			{
+//			}
+//			catch (ThreadAbortException)
+//			{
+//			}
+//			catch (Exception e)
+//			{
+//				parent.passExceptionToMain(e);
+//			}
+//		}
 		
 		//Messages
 
@@ -445,7 +468,12 @@ namespace KMPServer
 							queuedOutMessages.TryDequeue(out next_message);
 						}
 						isClientSendingData = true;
-						tcpClient.GetStream().BeginWrite(next_message, 0, next_message.Length, asyncSend, next_message);
+						NetOutgoingMessage msg = netConnection.Peer.CreateMessage(next_message.Length);
+						Log.Debug("Client({0}) sending {1} bytes.", playerID, next_message.Length);
+						Log.Debug(BitConverter.ToString(next_message));
+						msg.Write(next_message);
+						netConnection.SendMessage(msg, NetDeliveryMethod.ReliableOrdered, 1);
+//						tcpClient.GetStream().BeginWrite(next_message, 0, next_message.Length, asyncSend, next_message);
 					}
 				}
 			}
@@ -467,12 +495,29 @@ namespace KMPServer
 			
 		}
 
-		public void queueOutgoingMessage(KMPCommon.ServerMessageID id, byte[] data)
+		public void sendMessage(KMPCommon.ServerMessageID id, byte[] data)
 		{
-			queueOutgoingMessage(Server.buildMessageArray(id, data));
+			NetOutgoingMessage msg = netConnection.Peer.CreateMessage();
+			msg.Write((int)id);
+			if (data != null) {
+				data = KMPCommon.Compress(data);
+				msg.Write(data);
+			}
+			NetDeliveryMethod method = NetDeliveryMethod.ReliableOrdered;
+			int channel = 1;
+			switch (id) {
+				default:
+					break;
+			}
+			Log.Debug("Client({0}) sending {1} bytes", playerID, msg.LengthBytes);
+			netConnection.SendMessage(msg, method, channel);
+		}
+		public void queueOutgoingMessageOld(KMPCommon.ServerMessageID id, byte[] data)
+		{
+			queueOutgoingMessageOld(Server.buildMessageArray(id, data));
 		}
 
-		public void queueOutgoingMessage(byte[] message_bytes)
+		public void queueOutgoingMessageOld(byte[] message_bytes)
 		{
 			//Figure out if this is a high or low priority message
 			int sortMessageId = KMPCommon.intFromBytes(message_bytes, 0);
@@ -495,10 +540,10 @@ namespace KMPServer
 			}
 		}
 
-		internal void startReceivingMessages()
-		{
-			beginAsyncRead();
-		}
+//		internal void startReceivingMessages()
+//		{
+//			beginAsyncRead();
+//		}
 
 		internal void endReceivingMessages()
 		{
