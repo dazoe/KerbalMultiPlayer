@@ -227,6 +227,59 @@ public class KMPCommon
             if (ms != null) ms.Dispose();
         }
         return decompressedData;
-    } 
+    }
+    public static byte[] DiffCompress(byte[] reference, byte[] data) {
+    	if (reference.Length != data.Length) return null;
+    	byte[] result = null;
+    	using (MemoryStream ms = new MemoryStream())
+    	using (BinaryWriter writer = new BinaryWriter(ms)) {
+    		int offset = 0;
+    		int i = 0;
+    		while (i < data.Length) {
+    			offset = i;
+    			//same bytes.
+    			while ((i < data.Length) && (data[i] == reference[i]) && ((i - offset) < 127)) i++;
+    			if ((i - offset) > 0) {
+    				byte op = (byte)((0x80 | (i - offset)) & 0xFF);
+    				writer.Write(op);
+    				offset = i;
+    			}
+    			//diff bytes.
+    			while ((i < data.Length) && (data[i] != reference[i]) && ((i - offset) < 127)) i++;
+    			if ((i - offset) > 0) {
+    				byte op = (byte)((i - offset) & 0xFF);
+    				writer.Write(op);
+    				writer.Write(data, offset, i - offset);
+    			}
+    		}
+    		result = ms.ToArray();
+    	}
+    	return result;
+    }
+    public static byte[] DiffDecompress(byte[] reference, byte[] data) {
+    	byte[] result = null;
+    	using (MemoryStream ms = new MemoryStream())
+    	using (BinaryWriter writer = new BinaryWriter(ms)) {
+    		int i = 0;
+    		int offset = 0;
+    		while (i < data.Length) {
+    			byte count = (byte)(data[i] & 0x7F);
+    			if ((data[i] & 0x80) == 0x80) {
+    				//bytes were the same copy count from refernce
+    				writer.Write(reference, offset, count);
+    				offset += count;
+    				i++;
+    			} else {
+    				//bytes were different copy count from data
+    				i++;
+    				writer.Write(data, i, count);
+    				offset += count;
+    				i += count;
+    			}
+    		}
+    		result = ms.ToArray();
+    	}
+    	return result;
+    }
 }
 

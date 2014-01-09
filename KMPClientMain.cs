@@ -152,6 +152,8 @@ namespace KMP
 
         //Messages
 
+        public static byte[] previousPrimaryPluginUpdate = null;
+        public static byte[] previousSecondaryPluginUpdate = null;
         public static Queue<ServerMessage> receivedMessageQueue;
 
         public static byte[] currentMessageHeader = new byte[KMPCommon.MSG_HEADER_LENGTH];
@@ -2369,10 +2371,31 @@ namespace KMP
                 KMPCommon.ClientMessageID id
                     = primary ? KMPCommon.ClientMessageID.PRIMARY_PLUGIN_UPDATE : KMPCommon.ClientMessageID.SECONDARY_PLUGIN_UPDATE;
 
-                if (udpConnected && data.Length < 100)
-                    sendMessageUDP(id, data);
-                else
-                    sendMessageTCP(id, data);
+                byte[] compressed = null;
+                if (primary) {
+                	if (previousPrimaryPluginUpdate != null) {
+                		compressed = KMPCommon.DiffCompress(previousPrimaryPluginUpdate, data);
+                	}
+                	previousPrimaryPluginUpdate = data;
+                } else {
+                	if (previousSecondaryPluginUpdate != null) {
+                		compressed = KMPCommon.DiffCompress(previousSecondaryPluginUpdate, data);
+                	}
+                	previousSecondaryPluginUpdate = data;
+                }
+
+                if ((compressed != null) && (compressed.Length < data.Length)) {
+                	data = new byte[compressed.Length + 1];
+                	data[0] = 1;
+                	compressed.CopyTo(data, 1);
+                } else {
+                	byte[] tmp = new byte[data.Length + 1];
+                	tmp[0] = 0;
+                	data.CopyTo(tmp, 1);
+                	data = tmp;
+                }
+                // CANNOT use udp here because if the packet is dropped the server will fall out of sync with the diff.
+                sendMessageTCP(id, data);
             }
         }
 		

@@ -84,6 +84,9 @@ namespace KMPServer
 
 		public ConcurrentQueue<byte[]> queuedOutMessagesHighPriority;
 		public ConcurrentQueue<byte[]> queuedOutMessages;
+
+		public static byte[] previousPrimaryPluginUpdate = null;
+        public static byte[] previousSecondaryPluginUpdate = null;
 		
 		public string disconnectMessage = "";
 		
@@ -426,6 +429,31 @@ namespace KMPServer
 
 		private void messageReceived(KMPCommon.ClientMessageID id, byte[] data)
 		{
+			if ((id == KMPCommon.ClientMessageID.PRIMARY_PLUGIN_UPDATE) || (id == KMPCommon.ClientMessageID.SECONDARY_PLUGIN_UPDATE)) {
+				// Grab the correct reference data.
+				byte[] reference = (id == KMPCommon.ClientMessageID.PRIMARY_PLUGIN_UPDATE) ? previousPrimaryPluginUpdate : previousSecondaryPluginUpdate;
+				if ((reference == null) && (data[0] == 1)) {
+					throw new Exception("Received diff compressed data before uncompressed data");
+				}
+
+				byte[] tmp = new byte[data.Length - 1];
+				Array.Copy(data, 1, tmp, 0, tmp.Length);
+				if (data[0] == 1) { //Compressed
+					data = KMPCommon.DiffDecompress(reference, data);
+					if (data == null) {
+						throw new Exception("DiffDecompress failed!");
+					}
+				} else { //Uncompressed
+					data = tmp;
+				}
+
+				//Update previous data
+				if (id == KMPCommon.ClientMessageID.PRIMARY_PLUGIN_UPDATE) {
+					previousPrimaryPluginUpdate = data;
+				} else {
+					previousSecondaryPluginUpdate = data;
+				}
+			}
 			parent.queueClientMessage(this, id, data);
 		}
 
