@@ -3429,6 +3429,8 @@ namespace KMP
 			if (currentScene == GameScenes.EDITOR || currentScene == GameScenes.SPH || currentScene == GameScenes.SPACECENTER) return;
 			if (syncing || warping) return;
 
+			if (HighLogic.LoadedScene == GameScenes.EDITOR || HighLogic.LoadedScene == GameScenes.SPH) return; //Time does not advance in the VAB or SPH
+
 			if (!isInFlightOrTracking && isSkewingTime) {
 				Log.Debug ("Stopping skew time");
 				isSkewingTime = false;
