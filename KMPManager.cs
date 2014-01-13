@@ -3424,6 +3424,9 @@ namespace KMP
 
 		private void SkewTime ()
 		{
+			//Don't Skew Time in editors and SpaceCenter
+			GameScenes currentScene = HighLogic.LoadedScene;
+			if (currentScene == GameScenes.EDITOR || currentScene == GameScenes.SPH || currentScene == GameScenes.SPACECENTER) return;
 			if (syncing || warping) return;
 
 			if (!isInFlightOrTracking && isSkewingTime) {
