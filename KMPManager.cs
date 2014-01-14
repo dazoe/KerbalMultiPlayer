@@ -3458,39 +3458,12 @@ namespace KMP
 					return;
 				}
 
-				float timeWarpRate = 1f;
-
-				if (currentError < -0.0)
-					timeWarpRate = 1.05f;
-
-				if (currentError < -0.2)
-					timeWarpRate = 1.1f;
-
-				if (currentError < -0.5)
-					timeWarpRate = 1.5f;
-
-				if (currentError < -1)
-					timeWarpRate = 2f;
-
-				if (currentError > 0.0)
-					timeWarpRate = 0.95f;
-
-				if (currentError > 0.2)
-					timeWarpRate = 0.9f;
-
-				if (currentError > 0.5)
-					timeWarpRate = 0.75f;
-
-				if (currentError > 1)
-					timeWarpRate = 0.5f;
-
-
-
-
+				// dynamic warp
+				double timeWarpRate = Math.Pow(2, -currentError);
 
 				if (Math.Abs(currentError) > 0.2) {
 					isSkewingTime = true;
-					Time.timeScale = timeWarpRate;
+					Time.timeScale = (float)timeWarpRate;
 				}
 
 				if (Math.Abs(currentError) < 0.05 && isSkewingTime) {
